@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { pipeline } = require('stream/promises');
+const { google } = require('googleapis');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,7 +22,7 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin) || /vercel\.app$/.test(new URL(origin).hostname)) {
       return cb(null, true);
     }
-    return cb(null, true); // MVP: liberado para facilitar teste. Trave isso depois.
+    return cb(null, true);
   }
 }));
 app.use(express.json({ limit: '2mb' }));
@@ -62,53 +63,30 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function extractDriveFileId(input) {
-  if (!input || typeof input !== 'string') return null;
-  try {
-    const url = new URL(input);
-    const id = url.searchParams.get('id');
-    if (id) return id;
-  } catch (_) {}
+function extractDriveFileId(driveUrl) {
+  if (!driveUrl || typeof driveUrl !== 'string') return null;
 
   const patterns = [
     /drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/,
     /drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/,
-    /drive\.google\.com\/uc\?[^\s]*id=([a-zA-Z0-9_-]+)/,
-    /drive\.usercontent\.google\.com\/download\?[^\s]*id=([a-zA-Z0-9_-]+)/,
-    /\bid=([a-zA-Z0-9_-]+)/
+    /drive\.google\.com\/uc\?[\s\S]*?[?&]id=([a-zA-Z0-9_-]+)/,
+    /drive\.usercontent\.google\.com\/download\?[\s\S]*?[?&]id=([a-zA-Z0-9_-]+)/
   ];
+
   for (const pattern of patterns) {
-    const match = input.match(pattern);
+    const match = driveUrl.match(pattern);
     if (match?.[1]) return match[1];
   }
-  return null;
-}
 
-function parseSetCookie(headers) {
-  const raw = headers.get('set-cookie') || '';
-  return raw
-    .split(/,(?=\s*[^;]+=[^;]+)/)
-    .map((cookie) => cookie.split(';')[0].trim())
-    .filter(Boolean)
-    .join('; ');
-}
-
-function extractConfirmTokenFromHtml(html) {
-  const patterns = [
-    /confirm=([0-9A-Za-z_\-]+)/,
-    /name="confirm"\s+value="([0-9A-Za-z_\-]+)"/,
-    /confirm=([^&"']+)/
-  ];
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match?.[1]) return decodeURIComponent(match[1]);
+  try {
+    const url = new URL(driveUrl);
+    const id = url.searchParams.get('id');
+    if (id) return id;
+  } catch (_) {
+    return null;
   }
-  return null;
-}
 
-function contentLooksLikeVideo(contentType) {
-  const value = (contentType || '').toLowerCase();
-  return value.startsWith('video/') || value.includes('application/octet-stream');
+  return null;
 }
 
 function guessMimeType(filePath) {
@@ -120,60 +98,28 @@ function guessMimeType(filePath) {
   return 'video/mp4';
 }
 
-async function downloadToFile(url, filePath, cookieHeader) {
-  const response = await fetch(url, {
-    redirect: 'follow',
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      ...(cookieHeader ? { Cookie: cookieHeader } : {})
-    }
+function getDriveClient() {
+  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/drive.readonly']
   });
 
-  const contentType = response.headers.get('content-type') || '';
-  if (!response.ok) {
-    throw Object.assign(new Error(`Falha ao baixar vídeo do Drive. HTTP ${response.status}`), { statusCode: 400 });
-  }
-
-  if (contentType.toLowerCase().includes('text/html')) {
-    const html = await response.text();
-    return { html, contentType, response };
-  }
-
-  if (!contentLooksLikeVideo(contentType)) {
-    throw Object.assign(new Error(`Drive não retornou vídeo. Content-Type: ${contentType}`), { statusCode: 400 });
-  }
-
-  await pipeline(response.body, fs.createWriteStream(filePath));
-  return { filePath, contentType, response };
+  return google.drive({ version: 'v3', auth });
 }
 
-async function downloadDriveFile(driveUrl) {
-  const fileId = extractDriveFileId(driveUrl);
-  if (!fileId) {
-    throw Object.assign(new Error('Link do Google Drive inválido. Não foi possível extrair o fileId.'), { statusCode: 400 });
-  }
+async function downloadFromDrive(fileId, destPath) {
+  const drive = getDriveClient();
+  const res = await drive.files.get(
+    {
+      fileId,
+      alt: 'media',
+      supportsAllDrives: true
+    },
+    { responseType: 'stream' }
+  );
 
-  const filePath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${fileId}.mp4`);
-  const firstUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-  const first = await downloadToFile(firstUrl, filePath);
-
-  if (first.filePath) return filePath;
-
-  const confirmToken = extractConfirmTokenFromHtml(first.html || '');
-  const cookieHeader = parseSetCookie(first.response.headers);
-  if (!confirmToken) {
-    // Tenta rota usercontent mesmo sem token.
-    const directUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&confirm=t`;
-    const direct = await downloadToFile(directUrl, filePath, cookieHeader);
-    if (direct.filePath) return filePath;
-    throw Object.assign(new Error('Google Drive retornou HTML em vez do vídeo. Use link público ou backend autenticado com Google Drive API.'), { statusCode: 400 });
-  }
-
-  const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=${confirmToken}`;
-  const second = await downloadToFile(confirmUrl, filePath, cookieHeader);
-  if (second.filePath) return filePath;
-
-  throw Object.assign(new Error('Google Drive retornou página de confirmação em vez do vídeo.'), { statusCode: 400 });
+  await pipeline(res.data, fs.createWriteStream(destPath));
 }
 
 function inspectFile(filePath) {
@@ -186,12 +132,12 @@ function inspectFile(filePath) {
   };
 }
 
-async function uploadToGemini(filePath) {
-  const mimeType = guessMimeType(filePath);
+async function uploadToGemini(filePath, fallbackMimeType) {
+  const mimeType = fallbackMimeType || guessMimeType(filePath);
   const buffer = fs.readFileSync(filePath);
   const uploadUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${process.env.GEMINI_API_KEY}`;
 
-  console.log('Enviando vídeo para Gemini Files API...', { mimeType, sizeMB: (buffer.length / 1024 / 1024).toFixed(2) });
+  console.log('Enviando para Gemini Files API...');
   const response = await fetch(uploadUrl, {
     method: 'POST',
     headers: {
@@ -213,7 +159,7 @@ async function uploadToGemini(filePath) {
 }
 
 async function waitForGeminiActive(fileName) {
-  // Vídeos grandes podem demorar. Railway aguenta melhor que Vercel, mas evite timeout gigante no MVP.
+  console.log('Aguardando arquivo ACTIVE...');
   for (let i = 0; i < 120; i += 1) {
     const url = `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${process.env.GEMINI_API_KEY}`;
     const response = await fetch(url);
@@ -280,8 +226,12 @@ app.post('/analyze-drive', async (req, res) => {
   let fileInfo = { fileExists: false, fileSizeBytes: 0, fileSizeMB: 0 };
 
   try {
+    if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+      return res.status(500).json({ error: 'GOOGLE_SERVICE_ACCOUNT_JSON não configurada.' });
+    }
+
     if (!process.env.GEMINI_API_KEY) {
-      throw Object.assign(new Error('GEMINI_API_KEY não configurada. Análise real não executada.'), { statusCode: 500 });
+      return res.status(500).json({ error: 'GEMINI_API_KEY não configurada.' });
     }
 
     const { driveUrl, professor = '', turma = '', sala = '', prompt = DEFAULT_PROMPT } = req.body || {};
@@ -289,22 +239,49 @@ app.post('/analyze-drive', async (req, res) => {
       throw Object.assign(new Error('driveUrl é obrigatório.'), { statusCode: 400 });
     }
 
-    console.log('Baixando vídeo do Drive...');
-    filePath = await downloadDriveFile(driveUrl);
+    const fileId = extractDriveFileId(driveUrl);
+    if (!fileId) {
+      throw Object.assign(new Error('Link do Google Drive inválido. Não foi possível extrair o fileId.'), { statusCode: 400 });
+    }
+
+    console.log('Drive fileId:', fileId);
+
+    const drive = getDriveClient();
+    const metadataResponse = await drive.files.get({
+      fileId,
+      fields: 'id,name,mimeType,size',
+      supportsAllDrives: true
+    });
+
+    const driveFile = metadataResponse.data || {};
+    const driveMimeType = driveFile.mimeType || 'video/mp4';
+    const driveFileSizeBytes = Number(driveFile.size || 0);
+    const driveFileSizeMB = Number((driveFileSizeBytes / 1024 / 1024).toFixed(2));
+
+    filePath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${fileId}`);
+
+    console.log('Baixando via Google Drive API...');
+    await downloadFromDrive(fileId, filePath);
+
     fileInfo = inspectFile(filePath);
-    console.log('Vídeo baixado:', fileInfo);
+    console.log('Arquivo baixado:', fileInfo.fileSizeMB);
 
     if (!fileInfo.fileExists || fileInfo.fileSizeBytes < MIN_FILE_SIZE_BYTES) {
       throw Object.assign(new Error('Arquivo de vídeo inválido ou menor que 1MB.'), { statusCode: 400 });
     }
 
-    const uploaded = await uploadToGemini(filePath);
+    const uploaded = await uploadToGemini(filePath, driveMimeType);
     const active = await waitForGeminiActive(uploaded.name);
-    const metadata = { professor, turma, sala, driveUrl };
-    const rawResponse = await analyzeWithGemini({ ...uploaded, uri: active.uri || uploaded.uri }, metadata, prompt);
+    console.log('Gerando relatório...');
+
+    const metadata = { professor, turma, sala, driveUrl, driveFileId: fileId };
+    const rawResponse = await analyzeWithGemini({ ...uploaded, uri: active.uri || uploaded.uri, mimeType: driveMimeType }, metadata, prompt);
 
     res.json({
       fileSizeMB: fileInfo.fileSizeMB,
+      driveFileName: driveFile.name || null,
+      driveMimeType,
+      driveFileSizeMB,
       usedRealAI: true,
       provider: 'gemini',
       model: GEMINI_MODEL,
