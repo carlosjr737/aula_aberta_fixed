@@ -13,19 +13,18 @@ const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
 
 const allowedOrigins = [
   process.env.FRONTEND_URL,
+  'https://aula-aberta-fixed.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000'
 ].filter(Boolean);
 
 app.use(cors({
-  origin(origin, cb) {
-    if (!origin || allowedOrigins.includes(origin) || /vercel\.app$/.test(new URL(origin).hostname)) {
-      return cb(null, true);
-    }
-    return cb(null, true);
-  }
+  origin: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json({ limit: '2mb' }));
+
+app.options('*', cors());
 
 const DEFAULT_PROMPT = `Você é um especialista em pedagogia da dança, gestão de professores e análise de comportamento em sala de aula. Analise a aula inteira considerando o Perfil Professor DK.
 
