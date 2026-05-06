@@ -5,337 +5,107 @@ const os = require('os');
 const path = require('path');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
+const { CAMERAS, DEFAULT_DURATION_MIN } = require('./utils/constants');
+const { createRecordingId, startRtspRecording, stopRtspRecording } = require('./services/rtspRecorder');
+const { uploadVideo, uploadPdf } = require('./services/googleDriveUpload');
+const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
+const { generateLessonPdf } = require('./services/pdfGenerator');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
+const recordings = new Map();
 
-const allowedOrigins = [
-  process.env.FRONTEND_URL,
-  'https://aula-aberta-fixed.vercel.app',
-  'http://localhost:5173',
-  'http://localhost:3000'
-].filter(Boolean);
-
-app.use(cors({
-  origin: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-app.options('*', cors());
+app.use(cors({ origin: true }));
 app.use(express.json());
 
-const DEFAULT_PROMPT = `Você é um especialista em pedagogia da dança, gestão de professores e análise de comportamento em sala de aula. Analise a aula inteira considerando o Perfil Professor DK.
+const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-Perfil Professor DK:
-- conduz a aula com energia e presença
-- explica com clareza e objetividade
-- coloca os alunos em prática rapidamente
-- corrige individualmente e coletivamente
-- mantém a turma engajada
-- usa bem o espaço da sala
-- demonstra domínio técnico
-- cria ambiente seguro, motivador e exigente
-- equilibra técnica, disciplina, diversão e evolução
+function extractDriveFileId(driveUrl) { const m = driveUrl?.match(/\/d\/([a-zA-Z0-9_-]+)/); return m?.[1] || null; }
+function getDriveClientRO() { const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive.readonly'] }); return google.drive({ version: 'v3', auth }); }
+async function downloadFromDrive(fileId, destPath) { const drive = getDriveClientRO(); const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
 
-IMPORTANTE:
-- Analise o vídeo completo ao longo do tempo, não apenas um frame.
-- Use evidências observáveis do vídeo e do áudio.
-- Quando não for possível avaliar algo, diga claramente que não foi possível.
-- Evite inventar comportamentos não observados.
+app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
+app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
+app.get('/cameras', (_req, res) => res.json({ cameras: CAMERAS }));
 
-Formato do relatório:
-- Resumo geral
-- Pontos fortes
-- Pontos de melhoria
-- Energia e presença
-- Clareza da condução
-- Interação com alunos
-- Explicação vs prática
-- Correções realizadas
-- Alinhamento com o Perfil Professor DK
-- Nota geral de 0 a 10, apenas se houver evidência suficiente
-- Recomendações práticas para próxima aula`;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function extractDriveFileId(driveUrl) {
-  if (!driveUrl || typeof driveUrl !== 'string') return null;
-
-  const patterns = [
-    /drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/,
-    /drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/,
-    /drive\.google\.com\/uc\?[\s\S]*?[?&]id=([a-zA-Z0-9_-]+)/,
-    /drive\.usercontent\.google\.com\/download\?[\s\S]*?[?&]id=([a-zA-Z0-9_-]+)/
-  ];
-
-  for (const pattern of patterns) {
-    const match = driveUrl.match(pattern);
-    if (match?.[1]) return match[1];
-  }
-
+app.post('/start-recording', async (req, res) => {
   try {
-    const url = new URL(driveUrl);
-    const id = url.searchParams.get('id');
-    if (id) return id;
-  } catch (_) {
-    return null;
-  }
+    const { professor = '', turma = '', nivel = '', sala = '', durationMinutes = DEFAULT_DURATION_MIN, prompt = DEFAULT_PROMPT, camera = 'subway' } = req.body || {};
+    if (!CAMERAS[camera]?.rtsp) return res.status(400).json({ error: 'Câmera inválida ou sem RTSP configurado.' });
 
-  return null;
-}
+    const recordingId = createRecordingId();
+    const startedAt = new Date().toISOString();
+    const { outputPath, processRef, stderrRef } = startRtspRecording({ rtspUrl: CAMERAS[camera].rtsp, durationMinutes, recordingId });
+    recordings.set(recordingId, { recordingId, status: 'recording', analysisStatus: 'pending', outputPath, processRef, startedAt, professor, turma, nivel, sala, prompt, durationMinutes, camera, stderrRef });
 
-function guessMimeType(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.mov') return 'video/quicktime';
-  if (ext === '.avi') return 'video/x-msvideo';
-  if (ext === '.webm') return 'video/webm';
-  if (ext === '.mpeg' || ext === '.mpg') return 'video/mpeg';
-  return 'video/mp4';
-}
-
-function getDriveClient() {
-  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ['https://www.googleapis.com/auth/drive.readonly']
-  });
-
-  return google.drive({ version: 'v3', auth });
-}
-
-async function downloadFromDrive(fileId, destPath) {
-  const drive = getDriveClient();
-  const res = await drive.files.get(
-    {
-      fileId,
-      alt: 'media',
-      supportsAllDrives: true
-    },
-    { responseType: 'stream' }
-  );
-
-  await pipeline(res.data, fs.createWriteStream(destPath));
-}
-
-function inspectFile(filePath) {
-  const exists = !!filePath && fs.existsSync(filePath);
-  const bytes = exists ? fs.statSync(filePath).size : 0;
-  return {
-    fileExists: exists,
-    fileSizeBytes: bytes,
-    fileSizeMB: Number((bytes / 1024 / 1024).toFixed(2))
-  };
-}
-
-async function uploadToGemini(filePath, fallbackMimeType) {
-  const mimeType = fallbackMimeType || guessMimeType(filePath);
-  const stats = fs.statSync(filePath);
-  const fileSizeBytes = stats.size;
-  const fileSizeMB = Number((fileSizeBytes / 1024 / 1024).toFixed(2));
-  const memoryBeforeUpload = process.memoryUsage();
-  const uploadUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${process.env.GEMINI_API_KEY}`;
-
-  console.log(`Enviando para Gemini Files API... tamanho=${fileSizeMB}MB`);
-  console.log('Memória antes do upload:', {
-    rssMB: Number((memoryBeforeUpload.rss / 1024 / 1024).toFixed(2)),
-    heapUsedMB: Number((memoryBeforeUpload.heapUsed / 1024 / 1024).toFixed(2)),
-    externalMB: Number((memoryBeforeUpload.external / 1024 / 1024).toFixed(2))
-  });
-
-  const stream = fs.createReadStream(filePath);
-  const response = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: {
-      'X-Goog-Upload-Protocol': 'raw',
-      'X-Goog-Upload-File-Name': path.basename(filePath),
-      'Content-Type': mimeType,
-      'Content-Length': String(fileSizeBytes)
-    },
-    body: stream,
-    duplex: 'half'
-  });
-
-  const payload = await response.json();
-  if (!response.ok) {
-    throw Object.assign(new Error(payload?.error?.message || 'Falha ao enviar vídeo para Gemini Files API.'), { statusCode: 500 });
-  }
-  if (!payload?.file?.name || !payload?.file?.uri) {
-    throw Object.assign(new Error('Gemini Files API não retornou file.name/file.uri.'), { statusCode: 500 });
-  }
-
-  const memoryAfterUpload = process.memoryUsage();
-  console.log('Memória depois do upload:', {
-    rssMB: Number((memoryAfterUpload.rss / 1024 / 1024).toFixed(2)),
-    heapUsedMB: Number((memoryAfterUpload.heapUsed / 1024 / 1024).toFixed(2)),
-    externalMB: Number((memoryAfterUpload.external / 1024 / 1024).toFixed(2))
-  });
-
-  return { name: payload.file.name, uri: payload.file.uri, mimeType };
-}
-
-async function waitForGeminiActive(fileName) {
-  console.log('Aguardando arquivo ACTIVE...');
-  for (let i = 0; i < 120; i += 1) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${process.env.GEMINI_API_KEY}`;
-    const response = await fetch(url);
-    const data = await response.json();
-    if (!response.ok) {
-      throw Object.assign(new Error(data?.error?.message || 'Falha ao consultar status do arquivo Gemini.'), { statusCode: 500 });
-    }
-    console.log('Status Gemini file:', data.state);
-    if (data.state === 'ACTIVE') return data;
-    if (data.state === 'FAILED') {
-      throw Object.assign(new Error('Falha ao processar vídeo na Gemini Files API.'), { statusCode: 500 });
-    }
-    await sleep(5000);
-  }
-  throw Object.assign(new Error('Timeout: vídeo ainda processando na Gemini Files API. Tente novamente.'), { statusCode: 408 });
-}
-
-async function analyzeWithGemini(file, metadata, prompt) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-  const body = {
-    contents: [{
-      role: 'user',
-      parts: [
-        {
-          file_data: {
-            mime_type: file.mimeType,
-            file_uri: file.uri
-          }
-        },
-        {
-          text: `${prompt || DEFAULT_PROMPT}\n\nMetadata da aula: ${JSON.stringify(metadata)}\n\nAnalise o vídeo inteiro usando vídeo e áudio. Cite sinais observáveis e evite inferir o que não aparece.`
-        }
-      ]
-    }]
-  };
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw Object.assign(new Error(payload?.error?.message || 'Falha na chamada generateContent do Gemini.'), { statusCode: 500 });
-  }
-
-  const text = payload?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n').trim();
-  if (!text) {
-    throw Object.assign(new Error('Gemini retornou resposta vazia.'), { statusCode: 500 });
-  }
-  return text;
-}
-
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'aula-aberta-backend', model: GEMINI_MODEL });
+    processRef.on('exit', () => finalizeRecording(recordingId));
+    res.json({ recordingId, status: 'recording' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/default-prompt', (_req, res) => {
-  res.json({ defaultPrompt: DEFAULT_PROMPT });
+app.post('/stop-recording/:id', (req, res) => {
+  const rec = recordings.get(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'recordingId não encontrado' });
+  rec.status = 'stopping';
+  stopRtspRecording(rec.processRef);
+  res.json({ ok: true, status: rec.status });
 });
+
+app.get('/recording-status/:id', (req, res) => res.json(recordings.get(req.params.id) || { error: 'not_found' }));
+app.get('/analysis-status/:id', (req, res) => {
+  const rec = recordings.get(req.params.id);
+  if (!rec) return res.status(404).json({ error: 'not_found' });
+  res.json({ recordingId: rec.recordingId, analysisStatus: rec.analysisStatus, reportDriveFile: rec.reportDriveFile || null, error: rec.error || null });
+});
+
+async function finalizeRecording(recordingId) {
+  const rec = recordings.get(recordingId);
+  if (!rec) return;
+  rec.status = 'finished';
+  rec.endedAt = new Date().toISOString();
+  rec.analysisStatus = 'uploading_video';
+  try {
+    const driveVideo = await uploadVideo(rec.outputPath, rec);
+    rec.videoDriveFile = driveVideo;
+    rec.analysisStatus = 'processing_gemini';
+    const file = await uploadToGemini(rec.outputPath, 'video/mp4');
+    const active = await waitForGeminiActive(file.name);
+    const analysis = await analyzeVideo(active.uri, `${DEFAULT_PROMPT}\n\n${rec.prompt}`, rec);
+    rec.analysis = analysis;
+    rec.analysisStatus = 'generating_pdf';
+    const pdfPath = await generateLessonPdf({ ...rec, analysis, durationMinutes: rec.durationMinutes });
+    rec.analysisStatus = 'uploading_pdf';
+    rec.reportDriveFile = await uploadPdf(pdfPath, rec);
+    rec.analysisStatus = 'completed';
+    if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
+    if (fs.existsSync(rec.outputPath)) fs.unlinkSync(rec.outputPath);
+  } catch (error) {
+    rec.analysisStatus = 'failed';
+    rec.error = error.message;
+  }
+}
 
 app.post('/analyze-drive', async (req, res) => {
-  console.log('BODY RECEBIDO:', req.body);
   let filePath = null;
-  let fileInfo = { fileExists: false, fileSizeBytes: 0, fileSizeMB: 0 };
-
   try {
-    if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-      return res.status(500).json({ error: 'GOOGLE_SERVICE_ACCOUNT_JSON não configurada.' });
-    }
-
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY não configurada.' });
-    }
-
     const { driveUrl, professor = '', turma = '', sala = '', prompt = DEFAULT_PROMPT } = req.body || {};
-    if (!driveUrl) {
-      return res.status(400).json({ error: 'driveUrl é obrigatório' });
-    }
-
-    const fileId = extractDriveFileId(driveUrl);
-    if (!fileId) {
-      throw Object.assign(new Error('Link do Google Drive inválido. Não foi possível extrair o fileId.'), { statusCode: 400 });
-    }
-
-    console.log('Drive fileId:', fileId);
-
-    const drive = getDriveClient();
-    const metadataResponse = await drive.files.get({
-      fileId,
-      fields: 'id,name,mimeType,size',
-      supportsAllDrives: true
-    });
-
-    const driveFile = metadataResponse.data || {};
-    const driveMimeType = driveFile.mimeType || 'video/mp4';
-    const driveFileSizeBytes = Number(driveFile.size || 0);
-    const driveFileSizeMB = Number((driveFileSizeBytes / 1024 / 1024).toFixed(2));
-
-    filePath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${fileId}`);
-
-    console.log('Baixando via Google Drive API...');
+    const fileId = extractDriveFileId(driveUrl || '');
+    if (!fileId) return res.status(400).json({ error: 'Link inválido' });
+    filePath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${fileId}.mp4`);
     await downloadFromDrive(fileId, filePath);
-
-    fileInfo = inspectFile(filePath);
-    console.log('Arquivo baixado:', fileInfo.fileSizeMB, 'MB');
-
-    if (!fileInfo.fileExists || fileInfo.fileSizeBytes < MIN_FILE_SIZE_BYTES) {
-      throw Object.assign(new Error('Arquivo de vídeo inválido ou menor que 1MB.'), { statusCode: 400 });
-    }
-
-    let uploadWarning = null;
-    if (fileInfo.fileSizeBytes > 100 * 1024 * 1024) {
-      uploadWarning = 'Arquivo grande: usando upload em streaming/resumable.';
-      console.warn(uploadWarning);
-    }
-
-    const uploaded = await uploadToGemini(filePath, driveMimeType);
-    const active = await waitForGeminiActive(uploaded.name);
-    console.log('Gerando relatório...');
-
-    const metadata = { professor, turma, sala, driveUrl, driveFileId: fileId };
-    const rawResponse = await analyzeWithGemini({ ...uploaded, uri: active.uri || uploaded.uri, mimeType: driveMimeType }, metadata, prompt);
-
-    res.json({
-      fileSizeMB: fileInfo.fileSizeMB,
-      driveFileName: driveFile.name || null,
-      driveMimeType,
-      driveFileSizeMB,
-      warning: uploadWarning,
-      usedRealAI: true,
-      provider: 'gemini',
-      model: GEMINI_MODEL,
-      report: {
-        provider: 'gemini',
-        rawResponse,
-        promptUsado: prompt,
-        metadata,
-        analyzedAt: new Date().toISOString()
-      }
-    });
+    const size = fs.statSync(filePath).size;
+    if (size < MIN_FILE_SIZE_BYTES) return res.status(400).json({ error: 'Arquivo inválido' });
+    const file = await uploadToGemini(filePath, 'video/mp4');
+    const active = await waitForGeminiActive(file.name);
+    const rawResponse = await analyzeVideo(active.uri, prompt, { professor, turma, sala, driveFileId: fileId });
+    res.json({ usedRealAI: true, provider: 'gemini', model: GEMINI_MODEL, report: { rawResponse, promptUsado: prompt, metadata: { professor, turma, sala }, analyzedAt: new Date().toISOString() } });
   } catch (error) {
-    console.error('Erro /analyze-drive:', error);
-    res.status(error.statusCode || 500).json({
-      error: error.message || 'Erro ao analisar vídeo.',
-      fileSizeMB: fileInfo.fileSizeMB,
-      usedRealAI: false,
-      provider: 'gemini'
-    });
+    res.status(500).json({ error: error.message });
   } finally {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend DK Aula IA rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
