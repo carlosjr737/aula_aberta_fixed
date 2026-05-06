@@ -123,7 +123,7 @@ Variáveis:
 
 ```bash
 VITE_API_URL=https://aulaabertafixed-production.up.railway.app
-VITE_LOCAL_AGENT_URL=http://IP_DO_COMPUTADOR_DK:4000
+VITE_LOCAL_AGENT_URL=https://SEU_SUBDOMINIO.ngrok-free.app
 ```
 
 ### Configurar no Vercel
@@ -131,8 +131,8 @@ VITE_LOCAL_AGENT_URL=http://IP_DO_COMPUTADOR_DK:4000
 No projeto da Vercel:
 1. **Settings → Environment Variables**
 2. criar/editar `VITE_LOCAL_AGENT_URL`
-3. apontar para o IP do computador que roda o `agent-local`
-4. rede da escola deve permitir acesso HTTP a `:4000`
+3. apontar para a URL **HTTPS** do ngrok que expõe o `agent-local`
+4. usar o valor **sem barra no final** (ex.: `https://abc123.ngrok-free.app`)
 
 Se `VITE_LOCAL_AGENT_URL` não existir, a interface de gravação exibirá:
 
