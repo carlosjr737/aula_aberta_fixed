@@ -4,6 +4,7 @@ import './style.css';
 
 const API_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 const LOCAL_AGENT_URL = (import.meta.env.VITE_LOCAL_AGENT_URL || '').replace(/\/$/, '');
+const NGROK_HEADERS = { 'ngrok-skip-browser-warning': 'true' };
 
 function App() {
   const [tab, setTab] = useState('drive');
@@ -29,7 +30,7 @@ function App() {
   useEffect(() => {
     if (!recordingId || !LOCAL_AGENT_URL) return;
     const timer = setInterval(async () => {
-      const rec = await fetch(`${LOCAL_AGENT_URL}/recording-status/${recordingId}`).then((r) => r.json());
+      const rec = await fetch(`${LOCAL_AGENT_URL}/recording-status/${recordingId}`, { headers: NGROK_HEADERS }).then((r) => r.json());
       setRecordingStatus(rec.status || 'unknown');
       setStatus(`Gravação local: ${rec.status || '-'}`);
       if (rec.status === 'completed' || rec.status === 'failed') clearInterval(timer);
@@ -50,7 +51,7 @@ function App() {
 
   async function startRecording() {
     if (!LOCAL_AGENT_URL) return setStatus('Configure VITE_LOCAL_AGENT_URL para gravar localmente.');
-    const response = await fetch(`${LOCAL_AGENT_URL}/start-recording`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ professor, turma, nivel, sala, horario, durationMinutes, prompt, cameraId: camera }) });
+    const response = await fetch(`${LOCAL_AGENT_URL}/start-recording`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...NGROK_HEADERS }, body: JSON.stringify({ professor, turma, nivel, sala, horario, durationMinutes, prompt, cameraId: camera }) });
     const data = await response.json();
     if (!response.ok) return setStatus(data.error || 'Erro ao iniciar');
     setRecordingId(data.recordingId);
@@ -60,7 +61,7 @@ function App() {
 
   async function stopRecording() {
     if (!recordingId || !LOCAL_AGENT_URL) return;
-    const response = await fetch(`${LOCAL_AGENT_URL}/stop-recording/${recordingId}`, { method: 'POST' });
+    const response = await fetch(`${LOCAL_AGENT_URL}/stop-recording/${recordingId}`, { method: 'POST', headers: NGROK_HEADERS });
     const data = await response.json();
     setStatus(data.error || `Status: ${data.status}`);
   }
