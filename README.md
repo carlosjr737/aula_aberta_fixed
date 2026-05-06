@@ -1,43 +1,59 @@
-# DK Aula IA — arquitetura final
+# DK Aula IA — nova arquitetura (Railway + Agent Local)
 
 ## Estrutura
-- `frontend/`: Vite React para Vercel
-- `backend/`: Express para Railway
+- `frontend/`: Vite React
+- `backend/`: Express no Railway (somente análise por Drive + Gemini)
+- `agent-local/`: Express local (rede DK) para RTSP/FFmpeg + upload Drive + disparo de análise no Railway
 
-## Backend Railway
-Root directory: `backend`
+## Backend Railway (sem RTSP)
+Responsabilidades:
+- analisar vídeo do Google Drive
+- chamar Gemini
+- gerar relatório
+- retornar/salvar resultado
 
 Variáveis:
-```
+```bash
 GEMINI_API_KEY=...
 GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 GEMINI_MODEL=gemini-2.5-flash
 PORT=3001
-FRONTEND_URL=https://sua-url-vercel.vercel.app
 ```
 
-### Configuração Google Drive API (Service Account)
-1. No Google Cloud Console, crie uma **Service Account** no projeto.
-2. Ative a **Google Drive API** para esse projeto.
-3. Gere a chave JSON da Service Account.
-4. Compartilhe no Google Drive (arquivo ou pasta dos vídeos) com o e-mail da Service Account (ex: `nome@projeto.iam.gserviceaccount.com`) com permissão de leitura.
-5. No Railway, configure `GOOGLE_SERVICE_ACCOUNT_JSON` com o JSON completo em uma única variável de ambiente.
-6. No Railway, configure `GEMINI_API_KEY`.
+Endpoint principal:
+- `POST /analyze-drive` com `driveUrl` **ou** `fileId`, além de `professor`, `turma`, `nivel`, `sala`, `horario`, `prompt`
 
-Teste:
-```
-https://SEU_BACKEND/health
-```
-
-## Frontend Vercel
-Root directory: `frontend`
+## Agent Local (rede DK)
+Responsabilidades:
+- acessar RTSP local (`192.168.x.x`) via FFmpeg
+- gravar MP4 local
+- enviar para Google Drive via Service Account
+- chamar Railway `/analyze-drive`
 
 Variáveis:
-```
-VITE_API_URL=https://SEU_BACKEND.up.railway.app
+```bash
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+DRIVE_FOLDER_ID=...
+RAILWAY_API_URL=https://backend-railway.up.railway.app
+RTSP_BOLSO=rtsp://...
+RTSP_SUBWAY=rtsp://...
+RTSP_MIRANTE=rtsp://...
+PORT=4000
 ```
 
-## Fluxo
-1. Frontend envia `driveUrl` para o backend.
-2. Backend extrai o `fileId` e baixa o vídeo via Google Drive API autenticada (`files.get` com `alt=media`).
-3. Backend valida arquivo, envia para Gemini Files API, aguarda `ACTIVE` e gera relatório.
+Endpoints:
+- `POST /start-recording`
+- `POST /stop-recording/:id`
+- `GET /recording-status/:id`
+
+## Frontend
+Variáveis:
+```bash
+VITE_API_URL=https://backend-railway.up.railway.app
+VITE_LOCAL_AGENT_URL=http://IP_DO_COMPUTADOR_DK:4000
+```
+
+Fluxo:
+1. Aba **Analisar por Drive** chama Railway (`VITE_API_URL`).
+2. Aba **Gravar Aula** chama Agent Local (`VITE_LOCAL_AGENT_URL`) para iniciar/parar/status.
+3. Agent Local faz upload para Drive e aciona Railway com `fileId` + metadados.
