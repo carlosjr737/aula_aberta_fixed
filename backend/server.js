@@ -25,6 +25,7 @@ app.use(cors({
 }));
 
 app.options('*', cors());
+app.use(express.json());
 
 const DEFAULT_PROMPT = `Você é um especialista em pedagogia da dança, gestão de professores e análise de comportamento em sala de aula. Analise a aula inteira considerando o Perfil Professor DK.
 
@@ -221,6 +222,7 @@ app.get('/default-prompt', (_req, res) => {
 });
 
 app.post('/analyze-drive', async (req, res) => {
+  console.log('BODY RECEBIDO:', req.body);
   let filePath = null;
   let fileInfo = { fileExists: false, fileSizeBytes: 0, fileSizeMB: 0 };
 
@@ -235,7 +237,7 @@ app.post('/analyze-drive', async (req, res) => {
 
     const { driveUrl, professor = '', turma = '', sala = '', prompt = DEFAULT_PROMPT } = req.body || {};
     if (!driveUrl) {
-      throw Object.assign(new Error('driveUrl é obrigatório.'), { statusCode: 400 });
+      return res.status(400).json({ error: 'driveUrl é obrigatório' });
     }
 
     const fileId = extractDriveFileId(driveUrl);

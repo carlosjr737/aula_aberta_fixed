@@ -28,7 +28,13 @@ function App() {
 
   async function analyzeDrive() {
     if (!API_URL) return setStatus('VITE_API_URL não configurada.');
-    if (!driveUrl.trim()) return setStatus('Cole o link do Google Drive.');
+
+    const driveUrl = document.getElementById('driveUrl')?.value?.trim() || '';
+    if (!driveUrl) {
+      alert('Cole o link do Google Drive');
+      setStatus('Cole o link do Google Drive.');
+      return;
+    }
 
     setLoading(true);
     setReport(null);
@@ -74,7 +80,7 @@ function App() {
       {tab === 'drive' && (
         <section className="card">
           <label>Link do Google Drive
-            <input value={driveUrl} onChange={(e) => setDriveUrl(e.target.value)} placeholder="https://drive.google.com/file/d/.../view" />
+            <input id="driveUrl" value={driveUrl} onChange={(e) => setDriveUrl(e.target.value)} placeholder="https://drive.google.com/file/d/.../view" />
           </label>
           <label>Professor
             <input value={professor} onChange={(e) => setProfessor(e.target.value)} />
