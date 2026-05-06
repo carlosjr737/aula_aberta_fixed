@@ -9,106 +9,70 @@ function App() {
   const [driveUrl, setDriveUrl] = useState('');
   const [professor, setProfessor] = useState('');
   const [turma, setTurma] = useState('');
+  const [nivel, setNivel] = useState('');
   const [sala, setSala] = useState('');
   const [prompt, setPrompt] = useState('');
   const [status, setStatus] = useState('');
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [cameras, setCameras] = useState({});
+  const [camera, setCamera] = useState('subway');
+  const [durationMinutes, setDurationMinutes] = useState(60);
+  const [recordingId, setRecordingId] = useState('');
+  const [recordingStatus, setRecordingStatus] = useState('idle');
 
   useEffect(() => {
-    if (!API_URL) {
-      setStatus('Configure VITE_API_URL na Vercel apontando para o backend Railway.');
-      return;
-    }
-    fetch(`${API_URL}/default-prompt`)
-      .then((r) => r.json())
-      .then((data) => setPrompt(data.defaultPrompt || ''))
-      .catch(() => setStatus('Não consegui carregar o prompt padrão do backend.'));
+    fetch(`${API_URL}/default-prompt`).then((r) => r.json()).then((d) => setPrompt(d.defaultPrompt || '')).catch(() => {});
+    fetch(`${API_URL}/cameras`).then((r) => r.json()).then((d) => setCameras(d.cameras || {})).catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (!recordingId) return;
+    const timer = setInterval(async () => {
+      const rec = await fetch(`${API_URL}/recording-status/${recordingId}`).then((r) => r.json());
+      setRecordingStatus(rec.status || 'unknown');
+      const an = await fetch(`${API_URL}/analysis-status/${recordingId}`).then((r) => r.json());
+      setStatus(`Gravação: ${rec.status || '-'} | Análise: ${an.analysisStatus || '-'}`);
+      if (an.analysisStatus === 'completed' || an.analysisStatus === 'failed') clearInterval(timer);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [recordingId]);
+
   async function analyzeDrive() {
-    if (!API_URL) return setStatus('VITE_API_URL não configurada.');
-
-    const driveUrl = document.getElementById('driveUrl')?.value?.trim() || '';
-    if (!driveUrl) {
-      alert('Cole o link do Google Drive');
-      setStatus('Cole o link do Google Drive.');
-      return;
-    }
-
     setLoading(true);
-    setReport(null);
-    setStatus('Enviando pedido para o backend. Isso pode demorar em vídeo grande...');
-
     try {
-      const response = await fetch(`${API_URL}/analyze-drive`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ driveUrl, professor, turma, sala, prompt })
-      });
+      const response = await fetch(`${API_URL}/analyze-drive`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ driveUrl, professor, turma, sala, prompt }) });
       const data = await response.json();
-      if (!response.ok) {
-        setStatus(data.error || 'Falha ao analisar vídeo.');
-        setReport(data);
-        return;
-      }
-      setStatus(`Análise concluída. Arquivo: ${data.fileSizeMB} MB. Modelo: ${data.model}`);
+      if (!response.ok) return setStatus(data.error || 'Falha ao analisar');
       setReport(data);
-    } catch (error) {
-      setStatus(`Erro de conexão com backend: ${error.message}`);
+      setStatus('Análise concluída com sucesso.');
+    } catch (e) {
+      setStatus(`Erro: ${e.message}`);
     } finally {
       setLoading(false);
     }
   }
 
-  return (
-    <main className="container">
-      <h1>DK Aula IA — MVP</h1>
-      <p className="hint">Frontend na Vercel + Backend no Railway + Vídeo no Drive + Gemini Files API.</p>
+  async function startRecording() {
+    const response = await fetch(`${API_URL}/start-recording`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ professor, turma, nivel, sala, durationMinutes, prompt, camera }) });
+    const data = await response.json();
+    if (!response.ok) return setStatus(data.error || 'Erro ao iniciar');
+    setRecordingId(data.recordingId);
+    setRecordingStatus('recording');
+    setStatus(`Gravando com ID ${data.recordingId}`);
+  }
 
-      <div className="tabs">
-        <button className={tab === 'drive' ? 'active' : ''} onClick={() => setTab('drive')}>Analisar por Drive</button>
-        <button className={tab === 'record' ? 'active' : ''} onClick={() => setTab('record')}>Gravar aula</button>
-      </div>
+  async function stopRecording() {
+    if (!recordingId) return;
+    const response = await fetch(`${API_URL}/stop-recording/${recordingId}`, { method: 'POST' });
+    const data = await response.json();
+    setStatus(data.error || `Status: ${data.status}`);
+  }
 
-      {tab === 'record' && (
-        <section className="card">
-          <p><strong>Próxima fase:</strong> gravação RTSP automática a partir de um PC no DK. Neste MVP, use o Drive para validar a análise.</p>
-        </section>
-      )}
-
-      {tab === 'drive' && (
-        <section className="card">
-          <label>Link do Google Drive
-            <input id="driveUrl" value={driveUrl} onChange={(e) => setDriveUrl(e.target.value)} placeholder="https://drive.google.com/file/d/.../view" />
-          </label>
-          <label>Professor
-            <input value={professor} onChange={(e) => setProfessor(e.target.value)} />
-          </label>
-          <label>Turma
-            <input value={turma} onChange={(e) => setTurma(e.target.value)} />
-          </label>
-          <label>Sala
-            <input value={sala} onChange={(e) => setSala(e.target.value)} />
-          </label>
-          <label>Prompt de análise
-            <textarea rows="14" value={prompt} onChange={(e) => setPrompt(e.target.value)} />
-          </label>
-          <button onClick={analyzeDrive} disabled={loading}>{loading ? 'Analisando...' : 'Analisar vídeo do Drive'}</button>
-          <p className="status">{status}</p>
-        </section>
-      )}
-
-      <section className="card">
-        <h2>Relatório</h2>
-        {report ? (
-          <pre>{JSON.stringify(report, null, 2)}</pre>
-        ) : (
-          <pre>Nenhuma análise executada.</pre>
-        )}
-      </section>
-    </main>
-  );
+  return <main className="container"><h1>DK Aula IA</h1><div className="tabs"><button className={tab==='drive'?'active':''} onClick={()=>setTab('drive')}>Analisar por Drive</button><button className={tab==='record'?'active':''} onClick={()=>setTab('record')}>Gravar Aula</button></div>
+  {tab==='drive' && <section className="card"><label>Link<input value={driveUrl} onChange={(e)=>setDriveUrl(e.target.value)} /></label><button onClick={analyzeDrive} disabled={loading}>Analisar vídeo do Drive</button></section>}
+  {tab==='record' && <section className="card"><label>Professor<input value={professor} onChange={(e)=>setProfessor(e.target.value)} /></label><label>Turma<input value={turma} onChange={(e)=>setTurma(e.target.value)} /></label><label>Nível<input value={nivel} onChange={(e)=>setNivel(e.target.value)} /></label><label>Sala<input value={sala} onChange={(e)=>setSala(e.target.value)} /></label><label>Câmera<select value={camera} onChange={(e)=>setCamera(e.target.value)}>{Object.entries(cameras).map(([k,v])=><option key={k} value={k}>{v.name}</option>)}</select></label><label>Duração (min)<input type="number" value={durationMinutes} onChange={(e)=>setDurationMinutes(Number(e.target.value))} /></label><label>Prompt<textarea rows="8" value={prompt} onChange={(e)=>setPrompt(e.target.value)} /></label><button onClick={startRecording}>Iniciar</button><button onClick={stopRecording}>Parar</button><p>Status: {recordingStatus}</p></section>}
+  <section className="card"><p className="status">{status}</p><pre>{report ? JSON.stringify(report, null, 2) : 'Nenhuma análise executada.'}</pre></section></main>;
 }
 
 createRoot(document.getElementById('root')).render(<App />);
