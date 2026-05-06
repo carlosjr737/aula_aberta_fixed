@@ -134,18 +134,30 @@ function inspectFile(filePath) {
 
 async function uploadToGemini(filePath, fallbackMimeType) {
   const mimeType = fallbackMimeType || guessMimeType(filePath);
-  const buffer = fs.readFileSync(filePath);
+  const stats = fs.statSync(filePath);
+  const fileSizeBytes = stats.size;
+  const fileSizeMB = Number((fileSizeBytes / 1024 / 1024).toFixed(2));
+  const memoryBeforeUpload = process.memoryUsage();
   const uploadUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${process.env.GEMINI_API_KEY}`;
 
-  console.log('Enviando para Gemini Files API...');
+  console.log(`Enviando para Gemini Files API... tamanho=${fileSizeMB}MB`);
+  console.log('Memória antes do upload:', {
+    rssMB: Number((memoryBeforeUpload.rss / 1024 / 1024).toFixed(2)),
+    heapUsedMB: Number((memoryBeforeUpload.heapUsed / 1024 / 1024).toFixed(2)),
+    externalMB: Number((memoryBeforeUpload.external / 1024 / 1024).toFixed(2))
+  });
+
+  const stream = fs.createReadStream(filePath);
   const response = await fetch(uploadUrl, {
     method: 'POST',
     headers: {
       'X-Goog-Upload-Protocol': 'raw',
       'X-Goog-Upload-File-Name': path.basename(filePath),
-      'Content-Type': mimeType
+      'Content-Type': mimeType,
+      'Content-Length': String(fileSizeBytes)
     },
-    body: buffer
+    body: stream,
+    duplex: 'half'
   });
 
   const payload = await response.json();
@@ -155,6 +167,14 @@ async function uploadToGemini(filePath, fallbackMimeType) {
   if (!payload?.file?.name || !payload?.file?.uri) {
     throw Object.assign(new Error('Gemini Files API não retornou file.name/file.uri.'), { statusCode: 500 });
   }
+
+  const memoryAfterUpload = process.memoryUsage();
+  console.log('Memória depois do upload:', {
+    rssMB: Number((memoryAfterUpload.rss / 1024 / 1024).toFixed(2)),
+    heapUsedMB: Number((memoryAfterUpload.heapUsed / 1024 / 1024).toFixed(2)),
+    externalMB: Number((memoryAfterUpload.external / 1024 / 1024).toFixed(2))
+  });
+
   return { name: payload.file.name, uri: payload.file.uri, mimeType };
 }
 
@@ -265,10 +285,16 @@ app.post('/analyze-drive', async (req, res) => {
     await downloadFromDrive(fileId, filePath);
 
     fileInfo = inspectFile(filePath);
-    console.log('Arquivo baixado:', fileInfo.fileSizeMB);
+    console.log('Arquivo baixado:', fileInfo.fileSizeMB, 'MB');
 
     if (!fileInfo.fileExists || fileInfo.fileSizeBytes < MIN_FILE_SIZE_BYTES) {
       throw Object.assign(new Error('Arquivo de vídeo inválido ou menor que 1MB.'), { statusCode: 400 });
+    }
+
+    let uploadWarning = null;
+    if (fileInfo.fileSizeBytes > 100 * 1024 * 1024) {
+      uploadWarning = 'Arquivo grande: usando upload em streaming/resumable.';
+      console.warn(uploadWarning);
     }
 
     const uploaded = await uploadToGemini(filePath, driveMimeType);
@@ -283,6 +309,7 @@ app.post('/analyze-drive', async (req, res) => {
       driveFileName: driveFile.name || null,
       driveMimeType,
       driveFileSizeMB,
+      warning: uploadWarning,
       usedRealAI: true,
       provider: 'gemini',
       model: GEMINI_MODEL,
@@ -304,7 +331,7 @@ app.post('/analyze-drive', async (req, res) => {
     });
   } finally {
     if (filePath && fs.existsSync(filePath)) {
-      fs.unlink(filePath, () => {});
+      fs.unlinkSync(filePath);
     }
   }
 });
