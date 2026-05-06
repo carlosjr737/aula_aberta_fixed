@@ -6,20 +6,21 @@ const path = require('path');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
+const { generateLessonPdf } = require('./services/pdfGenerator');
+const { uploadPdf } = require('./services/googleDriveUpload');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
+const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
 
 app.use(cors({ origin: true }));
 app.use(express.json());
 
-const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
-
 function extractDriveFileId(input) {
   if (!input) return null;
   if (/^[a-zA-Z0-9_-]{20,}$/.test(input)) return input;
-  const m = input.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  const m = String(input).match(/\/d\/([a-zA-Z0-9_-]+)/);
   return m?.[1] || null;
 }
 
@@ -39,46 +40,70 @@ app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 
 app.post('/analyze-drive', async (req, res) => {
-  let filePath = null;
+  let videoPath = null;
+  let pdfPath = null;
   try {
     const {
       driveUrl,
-      fileId: bodyFileId,
+      driveFileId,
+      fileId,
       professor = '',
       turma = '',
       nivel = '',
       sala = '',
       horario = '',
-      prompt = DEFAULT_PROMPT
+      prompt = DEFAULT_PROMPT,
+      cameraId = '',
+      recordingStartedAt = '',
+      recordingEndedAt = ''
     } = req.body || {};
 
-    const fileId = extractDriveFileId(bodyFileId || driveUrl || '');
-    if (!fileId) return res.status(400).json({ error: 'É necessário enviar driveUrl ou fileId válidos.' });
+    const finalFileId = extractDriveFileId(driveFileId || fileId || driveUrl || '');
+    if (!finalFileId) return res.status(400).json({ error: 'É necessário enviar driveFileId, fileId ou driveUrl válidos.' });
 
-    filePath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${fileId}.mp4`);
-    await downloadFromDrive(fileId, filePath);
-    const size = fs.statSync(filePath).size;
+    videoPath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${finalFileId}.mp4`);
+    await downloadFromDrive(finalFileId, videoPath);
+
+    const size = fs.statSync(videoPath).size;
     if (size < MIN_FILE_SIZE_BYTES) return res.status(400).json({ error: 'Arquivo inválido' });
 
-    const file = await uploadToGemini(filePath, 'video/mp4');
+    const file = await uploadToGemini(videoPath, 'video/mp4');
     const active = await waitForGeminiActive(file.name);
-    const rawResponse = await analyzeVideo(active.uri, prompt, { professor, turma, nivel, sala, horario, driveFileId: fileId });
+    const rawResponse = await analyzeVideo(active.uri, prompt, { professor, turma, nivel, sala, horario, cameraId, driveFileId: finalFileId });
 
-    res.json({
+    const reportPayload = {
+      recordingId: finalFileId,
+      professor,
+      turma,
+      nivel,
+      sala,
+      startedAt: recordingStartedAt || 'Não informado',
+      endedAt: recordingEndedAt || 'Não informado',
+      durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado',
+      prompt,
+      analysis: rawResponse
+    };
+
+    pdfPath = await generateLessonPdf(reportPayload);
+    const pdfDriveFile = await uploadPdf(pdfPath, { professor });
+
+    return res.json({
       usedRealAI: true,
       provider: 'gemini',
       model: GEMINI_MODEL,
       report: {
         rawResponse,
         promptUsado: prompt,
-        metadata: { professor, turma, nivel, sala, horario, driveFileId: fileId },
+        metadata: { professor, turma, nivel, sala, horario, cameraId, driveFileId: finalFileId },
+        pdf: pdfDriveFile,
         analyzedAt: new Date().toISOString()
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   } finally {
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+    if (pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
   }
 });
 
