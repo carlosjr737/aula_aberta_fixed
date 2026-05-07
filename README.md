@@ -1,148 +1,63 @@
-# DK Aula IA — Arquitetura corrigida (Railway + Agent Local)
+# DK Aula IA — Fluxo com Cloudflare R2
 
-## Visão geral
+## Novo fluxo padrão
+1. `agent-local` grava RTSP com FFmpeg.
+2. `agent-local` envia MP4 para Cloudflare R2.
+3. `agent-local` gera signed URL temporária (>=2h).
+4. `agent-local` chama `POST {RAILWAY_API_URL}/analyze-video-url` com `videoUrl` + metadados.
+5. Backend Railway baixa o vídeo via URL, envia para Gemini e retorna análise.
+6. Upload de PDF é opcional via `PDF_UPLOAD_PROVIDER` (`none`, `r2`, `drive`).
 
-A arquitetura foi separada em três partes:
+## Configuração Cloudflare R2
+1. Criar bucket no Cloudflare R2.
+2. Criar Access Key com permissão de escrita/leitura no bucket.
+3. Copiar Account ID, Access Key ID e Secret Access Key.
 
-- **Railway (backend em nuvem):** apenas análise Gemini + integração Drive + geração/salvamento de PDF.
-- **agent-local (computador da escola):** gravação RTSP local com FFmpeg + upload do MP4 para Drive + chamada do Railway `/analyze-drive`.
-- **frontend (Vercel):**
-  - aba **Analisar por Drive** chama Railway (`VITE_API_URL`)
-  - aba **Gravar Aula** chama agent-local (`VITE_LOCAL_AGENT_URL`)
-
-> **Importante:** o Railway **não grava RTSP** e **não acessa IP local** da rede DK Studio.
-
----
-
-## 1) Rodar backend Railway
-
-Pasta: `backend/`
-
+## Variáveis no agent-local (`agent-local/.env`)
 ```bash
-cd backend
-npm install
-npm start
+PORT=4000
+RAILWAY_API_URL=https://seu-backend.railway.app
+RTSP_BOLSO=rtsp://...
+RTSP_MIRANTE=rtsp://...
+RTSP_SUBWAY=rtsp://...
+R2_ACCOUNT_ID=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+R2_BUCKET=
+R2_PUBLIC_BASE_URL=
+# opcionais (legado)
+GOOGLE_SERVICE_ACCOUNT_JSON=
+DRIVE_FOLDER_ID=
 ```
 
-Variáveis do backend (`backend/.env`):
-
+## Variáveis no Railway (backend)
 ```bash
 PORT=3001
-GEMINI_API_KEY=...
+GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
-GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+PDF_UPLOAD_PROVIDER=none
+R2_ACCOUNT_ID=
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+R2_BUCKET=
+R2_PUBLIC_BASE_URL=
+# somente se manter endpoint legado /analyze-drive
+GOOGLE_SERVICE_ACCOUNT_JSON=
 ```
 
-Endpoint principal:
-
-- `POST /analyze-drive`
-  - aceita `driveUrl` **ou** `driveFileId` (ou `fileId`)
-  - gera relatório IA
-  - gera PDF
-  - salva PDF no Drive
-
----
-
-## 2) Rodar agent-local no computador da escola
-
-Pasta: `agent-local/`
-
+## Rodar local
 ```bash
 cd agent-local
 npm install
 npm start
 ```
 
-### Configuração `.env`
-
-Copie `agent-local/.env.example` para `agent-local/.env` e ajuste:
-
+## Testes rápidos
 ```bash
-PORT=4000
-RAILWAY_API_URL=https://aulaabertafixed-production.up.railway.app
-GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
-DRIVE_FOLDER_ID=
-RTSP_BOLSO=rtsp://usuario:senha@192.168.1.5/stream
-RTSP_MIRANTE=rtsp://usuario:senha@192.168.1.6/stream
-RTSP_SUBWAY=rtsp://usuario:senha@192.168.1.7/stream
+curl http://localhost:4000/debug-env
+curl -X POST http://localhost:4000/start-recording -H "Content-Type: application/json" -d '{"cameraId":"mirante","durationMinutes":1}'
 ```
 
-Mapeamento de câmera no agent-local:
-
-- `bolso -> RTSP_BOLSO`
-- `mirante -> RTSP_MIRANTE`
-- `subway -> RTSP_SUBWAY`
-
-### Endpoints do agent-local
-
-- `POST /start-recording`
-- `POST /stop-recording/:recordingId`
-- `GET /recording-status/:recordingId`
-- `GET /health`
-
-### Fluxo da gravação local
-
-1. recebe metadados (`professor`, `turma`, `nivel`, `sala`, `horario`, `prompt`, `cameraId`, `durationMinutes`)
-2. grava RTSP via FFmpeg
-3. envia MP4 para Drive (`DRIVE_FOLDER_ID`)
-4. chama `POST {RAILWAY_API_URL}/analyze-drive` com `driveFileId` + metadados
-
----
-
-## 3) Instalar FFmpeg (agent-local)
-
-O `agent-local` depende do binário `ffmpeg` disponível no sistema.
-
-### Ubuntu/Debian
-```bash
-sudo apt update && sudo apt install -y ffmpeg
-```
-
-### Windows (Chocolatey)
-```bash
-choco install ffmpeg
-```
-
-### macOS (Homebrew)
-```bash
-brew install ffmpeg
-```
-
-Teste:
-```bash
-ffmpeg -version
-```
-
----
-
-## 4) Frontend e Vercel
-
-Pasta: `frontend/`
-
-Variáveis:
-
-```bash
-VITE_API_URL=https://aulaabertafixed-production.up.railway.app
-VITE_LOCAL_AGENT_URL=https://SEU_SUBDOMINIO.ngrok-free.app
-```
-
-### Configurar no Vercel
-
-No projeto da Vercel:
-1. **Settings → Environment Variables**
-2. criar/editar `VITE_LOCAL_AGENT_URL`
-3. apontar para a URL **HTTPS** do ngrok que expõe o `agent-local`
-4. usar o valor **sem barra no final** (ex.: `https://abc123.ngrok-free.app`)
-
-Se `VITE_LOCAL_AGENT_URL` não existir, a interface de gravação exibirá:
-
-`Configure VITE_LOCAL_AGENT_URL para gravar localmente.`
-
----
-
-## Segurança
-
-- credenciais RTSP ficam **somente** no `.env` do `agent-local`
-- frontend **não recebe** URLs RTSP
-- não existe endpoint que exponha RTSP completo
-- Railway não tenta acessar câmera local
+## Endpoints
+- Novo padrão: `POST /analyze-video-url`
+- Legado mantido: `POST /analyze-drive`
