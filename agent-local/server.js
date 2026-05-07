@@ -8,7 +8,6 @@ const { spawn } = require('child_process');
 const { google } = require('googleapis');
 
 const app = express();
-const PORT = Number(process.env.PORT || 4000);
 const RAILWAY_API_URL = String(process.env.RAILWAY_API_URL || '').replace(/\/$/, '');
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
 
@@ -23,11 +22,13 @@ const CAMERAS = {
 
 const recordings = new Map();
 
-app.use(cors({
-  origin: true,
+const corsOptions = {
+  origin: 'https://aula-aberta-fixed.vercel.app',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning']
-}));
+  allowedHeaders: ['Content-Type']
+};
+
+app.use(cors(corsOptions));
 app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
@@ -89,7 +90,7 @@ async function finalizeRecording(recordingId) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'agent-local' });
+  res.json({ ok: true });
 });
 
 app.post('/start-recording', (req, res) => {
@@ -138,8 +139,9 @@ app.post('/start-recording', (req, res) => {
   }
 });
 
-app.post('/stop-recording/:recordingId', (req, res) => {
-  const rec = recordings.get(req.params.recordingId);
+app.post('/stop-recording', (req, res) => {
+  const recordingId = req.body.recordingId;
+  const rec = recordings.get(recordingId);
   if (!rec) return res.status(404).json({ error: 'recordingId não encontrado' });
   rec.status = 'stopping';
   if (rec.processRef && !rec.processRef.killed) rec.processRef.kill('SIGINT');
@@ -169,6 +171,6 @@ app.use((err, _req, res, _next) => {
   return res.status(statusCode).json({ error: err?.message || 'internal_server_error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Agent local rodando na porta ${PORT}`);
+app.listen(4000, () => {
+  console.log('Agent local rodando na porta 4000');
 });
