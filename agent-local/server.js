@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -25,7 +27,7 @@ const recordings = new Map();
 const corsOptions = {
   origin: 'https://aula-aberta-fixed.vercel.app',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning']
 };
 
 app.use(cors(corsOptions));
@@ -97,7 +99,18 @@ app.post('/start-recording', (req, res) => {
   try {
     const cameraId = String(req.body.camera || req.body.cameraId || '').toLowerCase();
     const rtspUrl = CAMERAS[cameraId];
-    if (!rtspUrl) return res.status(400).json({ error: 'cameraId inválido.' });
+    if (!rtspUrl) {
+      return res.status(400).json({
+        error: 'RTSP não configurado para esta câmera',
+        cameraId,
+        availableCameras: Object.keys(CAMERAS),
+        hasRtsp: {
+          bolso: Boolean(process.env.RTSP_BOLSO),
+          mirante: Boolean(process.env.RTSP_MIRANTE),
+          subway: Boolean(process.env.RTSP_SUBWAY)
+        }
+      });
+    }
     if (!RAILWAY_API_URL) return res.status(500).json({ error: 'RAILWAY_API_URL não configurada.' });
 
     const durationMinutes = Math.max(1, Number(req.body.durationMinutes || 60));
@@ -139,13 +152,20 @@ app.post('/start-recording', (req, res) => {
   }
 });
 
-app.post('/stop-recording', (req, res) => {
-  const recordingId = req.body.recordingId;
+function stopRecordingById(recordingId, res) {
   const rec = recordings.get(recordingId);
   if (!rec) return res.status(404).json({ error: 'recordingId não encontrado' });
   rec.status = 'stopping';
   if (rec.processRef && !rec.processRef.killed) rec.processRef.kill('SIGINT');
   return res.json({ ok: true, recordingId: rec.recordingId, status: rec.status });
+}
+
+app.post('/stop-recording', (req, res) => {
+  return stopRecordingById(req.body.recordingId, res);
+});
+
+app.post('/stop-recording/:recordingId', (req, res) => {
+  return stopRecordingById(req.params.recordingId, res);
 });
 
 app.get('/recording-status/:recordingId', (req, res) => {
@@ -171,6 +191,8 @@ app.use((err, _req, res, _next) => {
   return res.status(statusCode).json({ error: err?.message || 'internal_server_error' });
 });
 
-app.listen(4000, () => {
-  console.log('Agent local rodando na porta 4000');
+const PORT = process.env.PORT || 4000;
+
+app.listen(PORT, () => {
+  console.log(`Agent local rodando na porta ${PORT}`);
 });
