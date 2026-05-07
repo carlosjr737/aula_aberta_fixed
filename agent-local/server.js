@@ -12,12 +12,17 @@ const { google } = require('googleapis');
 const REQUIRED_ENV_KEYS = [
   'PORT',
   'RAILWAY_API_URL',
-  'GOOGLE_SERVICE_ACCOUNT_JSON',
   'DRIVE_FOLDER_ID',
   'RTSP_SUBWAY',
   'RTSP_BOLSO',
-  'RTSP_MIRANTE'
+  'RTSP_MIRANTE',
+  'GOOGLE_SERVICE_ACCOUNT_JSON',
+  'GOOGLE_OAUTH_CLIENT_ID',
+  'GOOGLE_OAUTH_CLIENT_SECRET',
+  'GOOGLE_OAUTH_TOKEN_JSON'
 ];
+
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 
 function toBool(value) {
   return Boolean(String(value || '').trim());
@@ -33,20 +38,33 @@ function sanitizeJsonEnv(raw) {
   return normalized;
 }
 
-function parseServiceAccountJson(raw) {
+function parseJsonEnv(raw, envVarName) {
   try {
     const parsed = JSON.parse(sanitizeJsonEnv(raw));
     if (!parsed || typeof parsed !== 'object') {
-      throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON não é um objeto JSON válido.');
+      throw new Error(`${envVarName} não é um objeto JSON válido.`);
     }
-    if (!parsed.private_key || typeof parsed.private_key !== 'string') {
-      throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON sem private_key válida.');
-    }
-    parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
     return parsed;
   } catch (error) {
-    throw new Error(`Falha ao processar GOOGLE_SERVICE_ACCOUNT_JSON: ${error.message}`);
+    throw new Error(`Falha ao processar ${envVarName}: ${error.message}`);
   }
+}
+
+function parseServiceAccountJson(raw) {
+  const parsed = parseJsonEnv(raw, 'GOOGLE_SERVICE_ACCOUNT_JSON');
+  if (!parsed.private_key || typeof parsed.private_key !== 'string') {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON sem private_key válida.');
+  }
+  parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+  return parsed;
+}
+
+function parseOAuthTokenJson(raw) {
+  const parsed = parseJsonEnv(raw, 'GOOGLE_OAUTH_TOKEN_JSON');
+  if (!parsed.refresh_token && !parsed.access_token) {
+    throw new Error('GOOGLE_OAUTH_TOKEN_JSON sem access_token/refresh_token.');
+  }
+  return parsed;
 }
 
 function getEnvSummary() {
@@ -87,21 +105,67 @@ app.use(cors(corsOptions));
 app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
+function getOAuthClient() {
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI || 'http://localhost:4000/oauth2callback';
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+}
+
 function getDriveClient() {
-  const credentials = parseServiceAccountJson(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive'] });
-  return google.drive({ version: 'v3', auth });
+  const hasOAuth = toBool(process.env.GOOGLE_OAUTH_CLIENT_ID)
+    && toBool(process.env.GOOGLE_OAUTH_CLIENT_SECRET)
+    && toBool(process.env.GOOGLE_OAUTH_TOKEN_JSON);
+
+  if (hasOAuth) {
+    try {
+      const oauth2Client = getOAuthClient();
+      const tokens = parseOAuthTokenJson(process.env.GOOGLE_OAUTH_TOKEN_JSON);
+      oauth2Client.setCredentials(tokens);
+      return {
+        drive: google.drive({ version: 'v3', auth: oauth2Client }),
+        authMode: 'oauth_user'
+      };
+    } catch (error) {
+      throw new Error(`Credenciais OAuth inválidas: ${error.message}`);
+    }
+  }
+
+  if (toBool(process.env.GOOGLE_SERVICE_ACCOUNT_JSON)) {
+    try {
+      const credentials = parseServiceAccountJson(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+      const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive'] });
+      return {
+        drive: google.drive({ version: 'v3', auth }),
+        authMode: 'service_account'
+      };
+    } catch (error) {
+      throw new Error(`Credenciais Service Account inválidas: ${error.message}`);
+    }
+  }
+
+  throw new Error('Nenhuma credencial Google Drive válida encontrada. Configure OAuth (GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_TOKEN_JSON) ou GOOGLE_SERVICE_ACCOUNT_JSON.');
 }
 
 async function uploadVideo(filePath) {
-  const drive = getDriveClient();
+  const { drive, authMode } = getDriveClient();
   const media = { mimeType: 'video/mp4', body: fs.createReadStream(filePath) };
   const requestBody = {
     name: path.basename(filePath),
     parents: DRIVE_FOLDER_ID ? [DRIVE_FOLDER_ID] : undefined
   };
-  const res = await drive.files.create({ requestBody, media, fields: 'id,webViewLink', supportsAllDrives: true });
-  return res.data;
+
+  try {
+    const res = await drive.files.create({ requestBody, media, fields: 'id,webViewLink', supportsAllDrives: true });
+    return {
+      driveFileId: res.data.id,
+      driveFileUrl: res.data.webViewLink || null,
+      authMode
+    };
+  } catch (error) {
+    const details = error?.response?.data ? JSON.stringify(error.response.data) : error.message;
+    throw new Error(`Falha no upload para Google Drive (${authMode}): ${details}`);
+  }
 }
 
 async function finalizeRecording(recordingId) {
@@ -112,15 +176,16 @@ async function finalizeRecording(recordingId) {
   try {
     rec.status = 'uploading_drive';
     const driveFile = await uploadVideo(rec.outputPath);
-    rec.driveFileId = driveFile.id;
-    rec.driveFileUrl = driveFile.webViewLink || null;
+    rec.driveFileId = driveFile.driveFileId;
+    rec.driveFileUrl = driveFile.driveFileUrl;
+    rec.driveAuthMode = driveFile.authMode;
 
     rec.status = 'analyzing';
     const response = await fetch(`${RAILWAY_API_URL}/analyze-drive`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        driveFileId: driveFile.id,
+        driveFileId: driveFile.driveFileId,
         professor: rec.professor,
         turma: rec.turma,
         nivel: rec.nivel,
@@ -141,6 +206,11 @@ async function finalizeRecording(recordingId) {
   } catch (error) {
     rec.status = 'failed';
     rec.error = error.message;
+    rec.errorDetails = {
+      stack: error.stack,
+      at: new Date().toISOString()
+    };
+    console.error(`[recording:${recordingId}] erro:`, error);
   } finally {
     if (fs.existsSync(rec.outputPath)) fs.unlinkSync(rec.outputPath);
   }
@@ -152,6 +222,52 @@ app.get('/health', (_req, res) => {
 
 app.get('/debug-env', (_req, res) => {
   res.json(getEnvSummary());
+});
+
+app.get('/auth/google', (_req, res) => {
+  try {
+    if (!toBool(process.env.GOOGLE_OAUTH_CLIENT_ID) || !toBool(process.env.GOOGLE_OAUTH_CLIENT_SECRET)) {
+      return res.status(400).json({
+        error: 'Configure GOOGLE_OAUTH_CLIENT_ID e GOOGLE_OAUTH_CLIENT_SECRET antes de iniciar o fluxo OAuth.'
+      });
+    }
+
+    const oauth2Client = getOAuthClient();
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: [DRIVE_SCOPE]
+    });
+
+    return res.redirect(authUrl);
+  } catch (error) {
+    return res.status(500).json({ error: `Falha ao gerar URL OAuth: ${error.message}` });
+  }
+});
+
+app.get('/oauth2callback', async (req, res) => {
+  try {
+    const code = req.query.code;
+    if (!code) return res.status(400).send('Parâmetro "code" não recebido do Google OAuth.');
+
+    const oauth2Client = getOAuthClient();
+    const { tokens } = await oauth2Client.getToken(String(code));
+
+    return res.status(200).send(`<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>OAuth concluído</title></head>
+<body style="font-family: Arial, sans-serif; margin: 24px;">
+  <h2>OAuth do Google Drive concluído ✅</h2>
+  <p>Copie o valor abaixo e cole no seu <code>.env</code> como <code>GOOGLE_OAUTH_TOKEN_JSON</code>.</p>
+  <textarea style="width:100%;height:220px;">${JSON.stringify(tokens)}</textarea>
+  <pre style="white-space: pre-wrap; background:#f5f5f5; padding: 12px;">GOOGLE_OAUTH_TOKEN_JSON=${JSON.stringify(tokens)}</pre>
+  <p>Depois reinicie o agent-local.</p>
+</body>
+</html>`);
+  } catch (error) {
+    const details = error?.response?.data ? JSON.stringify(error.response.data) : error.message;
+    return res.status(500).send(`Falha ao trocar code por token: ${details}`);
+  }
 });
 
 app.post('/start-recording', (req, res) => {
@@ -198,8 +314,10 @@ app.post('/start-recording', (req, res) => {
       finishedAt: null,
       driveFileId: null,
       driveFileUrl: null,
+      driveAuthMode: null,
       railwayResponse: null,
-      error: null
+      error: null,
+      errorDetails: null
     };
 
     recordings.set(recordingId, rec);
@@ -226,6 +344,7 @@ app.post('/start-recording', (req, res) => {
       rec.status = 'failed';
       rec.finishedAt = new Date().toISOString();
       rec.error = `Falha ao iniciar FFmpeg: ${error.message}`;
+      rec.errorDetails = { stack: error.stack, at: new Date().toISOString() };
     });
 
     ffmpeg.on('close', async (code) => {
@@ -282,6 +401,7 @@ app.get('/recording-status/:recordingId', (req, res) => {
     id: rec.id,
     status: rec.status,
     error: rec.error,
+    errorDetails: rec.errorDetails,
     outputPath: rec.outputPath,
     fileSize: rec.fileSize,
     cameraId: rec.cameraId,
@@ -289,6 +409,7 @@ app.get('/recording-status/:recordingId', (req, res) => {
     finishedAt: rec.finishedAt,
     driveFileId: rec.driveFileId,
     driveFileUrl: rec.driveFileUrl,
+    driveAuthMode: rec.driveAuthMode,
     railwayResponse: rec.railwayResponse
   });
 });

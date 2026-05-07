@@ -60,11 +60,19 @@ Copie `agent-local/.env.example` para `agent-local/.env` e ajuste:
 ```bash
 PORT=4000
 RAILWAY_API_URL=https://aulaabertafixed-production.up.railway.app
-GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 DRIVE_FOLDER_ID=
 RTSP_BOLSO=rtsp://usuario:senha@192.168.1.5/stream
 RTSP_MIRANTE=rtsp://usuario:senha@192.168.1.6/stream
 RTSP_SUBWAY=rtsp://usuario:senha@192.168.1.7/stream
+
+# OAuth local (prioritário)
+GOOGLE_OAUTH_CLIENT_ID=
+GOOGLE_OAUTH_CLIENT_SECRET=
+GOOGLE_OAUTH_REDIRECT_URI=http://localhost:4000/oauth2callback
+GOOGLE_OAUTH_TOKEN_JSON=
+
+# Fallback legado
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
 ```
 
 Mapeamento de câmera no agent-local:
@@ -72,6 +80,18 @@ Mapeamento de câmera no agent-local:
 - `bolso -> RTSP_BOLSO`
 - `mirante -> RTSP_MIRANTE`
 - `subway -> RTSP_SUBWAY`
+
+
+
+### Autorizar OAuth Google Drive
+
+Depois de iniciar o agent-local:
+
+1. Abra `http://localhost:4000/auth/google`
+2. Faça login com a conta Google e autorize o app
+3. Copie o `GOOGLE_OAUTH_TOKEN_JSON` exibido em `/oauth2callback`
+4. Cole no `.env`
+5. Reinicie com `npm start`
 
 ### Endpoints do agent-local
 
