@@ -8,10 +8,10 @@ const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
-const { uploadFileToR2 } = require('./services/r2Upload');
+const { uploadFileToGCS, generateSignedReadUrl } = require('./services/gcsStorage');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
 const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
 
@@ -25,6 +25,7 @@ async function downloadFromUrl(url, destPath) { const response = await fetch(url
 
 app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
+app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), GCS_BUCKET_NAME: Boolean(process.env.GCS_BUCKET_NAME), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
 async function analyzeFromLocalVideo({ videoPath, recordingId, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt }) {
   const file = await uploadToGemini(videoPath, 'video/mp4');
@@ -34,28 +35,36 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, professor, turma,
   const reportPayload = { recordingId, professor, turma, nivel, sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
 
   const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'none').toLowerCase();
-  let pdf = null;
+  let pdfUrl = null;
   let pdfPath = null;
-  if (pdfUploadProvider !== 'none') {
+  if (pdfUploadProvider === 'gcs') {
     pdfPath = await generateLessonPdf(reportPayload);
-    if (pdfUploadProvider === 'r2') pdf = await uploadFileToR2(pdfPath, { keyPrefix: 'pdf-reports' });
-    if (pdfUploadProvider === 'drive') pdf = await uploadPdf(pdfPath, { professor });
-    if (pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
+    const analysisId = recordingId || `analysis_${Date.now()}`;
+    const date = new Date().toISOString().slice(0, 10);
+    const fileName = `reports/${date}/${analysisId}.pdf`;
+    await uploadFileToGCS(pdfPath, fileName, 'application/pdf');
+    pdfUrl = await generateSignedReadUrl(fileName, 120);
+  } else if (pdfUploadProvider === 'drive') {
+    pdfPath = await generateLessonPdf(reportPayload);
+    const driveData = await uploadPdf(pdfPath, { professor });
+    pdfUrl = driveData?.webViewLink || null;
   }
+  if (pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
 
-  return { usedRealAI: true, provider: 'gemini', model: GEMINI_MODEL, report: { rawResponse, promptUsado: prompt, metadata: { professor, turma, nivel, sala, horario, cameraId, recordingId }, pdf, analyzedAt: new Date().toISOString() } };
+  return { usedRealAI: true, provider: 'gemini', model: GEMINI_MODEL, report: { rawResponse, promptUsado: prompt, metadata: { professor, turma, nivel, sala, horario, cameraId, recordingId }, analyzedAt: new Date().toISOString() }, pdfUrl };
 }
 
 app.post('/analyze-video-url', async (req, res) => {
   let videoPath = null;
   try {
-    const { videoUrl, r2Key = '', professor = '', turma = '', nivel = '', sala = '', horario = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
+    const { videoUrl, gcsBucket = '', gcsFileName = '', professor = '', turma = '', nivel = '', sala = '', horario = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl é obrigatório.' });
-    videoPath = path.join(os.tmpdir(), `r2_video_${Date.now()}.mp4`);
+    videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}.mp4`);
     await downloadFromUrl(videoUrl, videoPath);
+    if (!fs.existsSync(videoPath)) return res.status(400).json({ error: 'Arquivo de vídeo não foi baixado corretamente.' });
     const size = fs.statSync(videoPath).size;
     if (size < MIN_FILE_SIZE_BYTES) return res.status(400).json({ error: `Arquivo inválido (${size} bytes).` });
-    return res.json(await analyzeFromLocalVideo({ videoPath, recordingId: r2Key || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt }));
+    return res.json(await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName }));
   } catch (error) { return res.status(500).json({ error: error.message }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });

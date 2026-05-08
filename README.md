@@ -1,49 +1,36 @@
-# DK Aula IA — Fluxo com Cloudflare R2
+# DK Aula IA — Fluxo padrão com Google Cloud Storage
 
-## Novo fluxo padrão
+## Fluxo padrão novo
 1. `agent-local` grava RTSP com FFmpeg.
-2. `agent-local` envia MP4 para Cloudflare R2.
+2. `agent-local` faz upload do MP4 para Google Cloud Storage.
 3. `agent-local` gera signed URL temporária (>=2h).
 4. `agent-local` chama `POST {RAILWAY_API_URL}/analyze-video-url` com `videoUrl` + metadados.
 5. Backend Railway baixa o vídeo via URL, envia para Gemini e retorna análise.
-6. Upload de PDF é opcional via `PDF_UPLOAD_PROVIDER` (`none`, `r2`, `drive`).
+6. Frontend exibe o relatório.
 
-## Configuração Cloudflare R2
-1. Criar bucket no Cloudflare R2.
-2. Criar Access Key com permissão de escrita/leitura no bucket.
-3. Copiar Account ID, Access Key ID e Secret Access Key.
+## Como criar bucket no Google Cloud Storage
+1. Criar bucket no mesmo projeto da Service Account.
+2. Dar permissão `Storage Object Admin` para a Service Account no bucket.
+3. Copiar o nome do bucket para `GCS_BUCKET_NAME`.
 
-## Variáveis no agent-local (`agent-local/.env`)
-```bash
-PORT=4000
-RAILWAY_API_URL=https://seu-backend.railway.app
-RTSP_BOLSO=rtsp://...
-RTSP_MIRANTE=rtsp://...
-RTSP_SUBWAY=rtsp://...
-R2_ACCOUNT_ID=
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_BUCKET=
-R2_PUBLIC_BASE_URL=
-# opcionais (legado)
-GOOGLE_SERVICE_ACCOUNT_JSON=
-DRIVE_FOLDER_ID=
-```
+## Variáveis no `agent-local`
+Use `agent-local/.env.example` como base:
+- `PORT`
+- `RAILWAY_API_URL`
+- `GOOGLE_SERVICE_ACCOUNT_JSON`
+- `GCS_BUCKET_NAME`
+- `RTSP_SUBWAY`
+- `RTSP_BOLSO`
+- `RTSP_MIRANTE`
 
-## Variáveis no Railway (backend)
-```bash
-PORT=3001
-GEMINI_API_KEY=
-GEMINI_MODEL=gemini-2.5-flash
-PDF_UPLOAD_PROVIDER=none
-R2_ACCOUNT_ID=
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_BUCKET=
-R2_PUBLIC_BASE_URL=
-# somente se manter endpoint legado /analyze-drive
-GOOGLE_SERVICE_ACCOUNT_JSON=
-```
+## Variáveis no `backend` (Railway)
+Use `backend/.env.example` como base:
+- `PORT`
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL`
+- `GOOGLE_SERVICE_ACCOUNT_JSON`
+- `GCS_BUCKET_NAME`
+- `PDF_UPLOAD_PROVIDER` (`none` ou `gcs`)
 
 ## Rodar local
 ```bash
@@ -52,10 +39,13 @@ npm install
 npm start
 ```
 
-## Testes rápidos
+## Testar
 ```bash
 curl http://localhost:4000/debug-env
-curl -X POST http://localhost:4000/start-recording -H "Content-Type: application/json" -d '{"cameraId":"mirante","durationMinutes":1}'
+
+curl -X POST http://localhost:4000/start-recording \
+  -H "Content-Type: application/json" \
+  -d '{"cameraId":"mirante","durationMinutes":1,"prompt":"Analise a aula inteira com foco em didática, energia e clareza."}'
 ```
 
 ## Endpoints
