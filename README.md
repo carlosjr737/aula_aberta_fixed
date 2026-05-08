@@ -51,3 +51,6 @@ curl -X POST http://localhost:4000/start-recording \
 ## Endpoints
 - Novo padrão: `POST /analyze-video-url`
 - Legado mantido: `POST /analyze-drive`
+
+## Observação sobre validação de vídeo RTSP
+Vídeos de câmeras RTSP em baixa resolução/bitrate podem ser pequenos. A validação correta é por ffprobe, não apenas por tamanho.

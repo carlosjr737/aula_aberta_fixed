@@ -3,10 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { google } = require('googleapis');
 const { Storage } = require('@google-cloud/storage');
 
@@ -75,8 +74,10 @@ async function uploadVideoToGCS(filePath, metadata = {}) {
 const app = express();
 const RAILWAY_API_URL = String(process.env.RAILWAY_API_URL || '').replace(/\/$/, '');
 const PORT = Number(process.env.PORT || 4000);
-const RECORDINGS_DIR = path.join(os.tmpdir(), 'dk-local-recordings');
-const MIN_FILE_SIZE_BYTES = 64 * 1024;
+const RECORDINGS_DIR = path.join(__dirname, 'recordings');
+const MIN_FILE_SIZE_BYTES = 50 * 1024;
+const FFPROBE_FALLBACK_MIN_BYTES = 100 * 1024;
+const CLEANUP_LOCAL_FILES = false;
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY };
@@ -101,12 +102,16 @@ async function finalizeRecording(recordingId) {
   const rec = recordings.get(recordingId);
   if (!rec) return;
   rec.finishedAt = new Date().toISOString();
+  let currentStage = 'uploading_gcs';
   try {
-    rec.status = 'uploading_gcs';
+    rec.status = currentStage;
     const gcsUpload = await uploadVideoToGCS(rec.outputPath, { professor: rec.professor, turma: rec.turma, cameraId: rec.cameraId, recordingId: rec.recordingId });
     Object.assign(rec, gcsUpload);
 
-    rec.status = 'analyzing';
+    currentStage = 'generating_signed_url';
+    rec.status = currentStage;
+    currentStage = 'calling_railway';
+    rec.status = currentStage;
     const response = await fetch(`${RAILWAY_API_URL}/analyze-video-url`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
       videoUrl: rec.videoUrl, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, professor: rec.professor, turma: rec.turma, nivel: rec.nivel, sala: rec.sala, horario: rec.horario, prompt: rec.prompt, cameraId: rec.cameraId, recordingStartedAt: rec.startedAt, recordingEndedAt: rec.finishedAt
     }) });
@@ -117,9 +122,52 @@ async function finalizeRecording(recordingId) {
     rec.status = 'completed';
   } catch (error) {
     rec.status = 'failed';
+    rec.failedStage = currentStage;
     rec.error = error.message;
   } finally {
-    if (fs.existsSync(rec.outputPath)) fs.unlinkSync(rec.outputPath);
+    if (CLEANUP_LOCAL_FILES && fs.existsSync(rec.outputPath)) fs.unlinkSync(rec.outputPath);
+  }
+}
+
+function runFfprobe(filePath) {
+  return new Promise((resolve, reject) => {
+    const args = ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath];
+    execFile('ffprobe', args, { maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
+      if (error) {
+        const details = stderr || stdout || error.message;
+        return reject(new Error(`ffprobe error: ${details}`));
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+async function validateVideoFile(filePath) {
+  if (!fs.existsSync(filePath)) return { valid: false, error: 'Arquivo de saída não foi criado.' };
+  const fileSize = fs.statSync(filePath).size;
+  if (fileSize < MIN_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo inválido (${fileSize} bytes).` };
+
+  try {
+    const ffprobeRaw = await runFfprobe(filePath);
+    const ffprobeData = JSON.parse(ffprobeRaw);
+    const streams = Array.isArray(ffprobeData.streams) ? ffprobeData.streams : [];
+    const videoStream = streams.find((stream) => stream.codec_type === 'video');
+    if (!videoStream) return { valid: false, fileSize, error: 'ffprobe não encontrou stream de vídeo.', ffprobeData };
+    return {
+      valid: true,
+      fileSize,
+      duration: Number(ffprobeData?.format?.duration || 0),
+      codec: videoStream.codec_name || null,
+      width: Number(videoStream.width || 0) || null,
+      height: Number(videoStream.height || 0) || null,
+      hasAudio: streams.some((stream) => stream.codec_type === 'audio')
+    };
+  } catch (error) {
+    const warning = 'ffprobe falhou, mas arquivo tem tamanho suficiente para teste.';
+    if (fileSize >= FFPROBE_FALLBACK_MIN_BYTES) {
+      return { valid: true, fileSize, duration: null, codec: null, width: null, height: null, hasAudio: null, warning, ffprobeError: error.message };
+    }
+    return { valid: false, fileSize, error: `ffprobe falhou: ${error.message}`, ffprobeError: error.message };
   }
 }
 
@@ -139,15 +187,22 @@ app.post('/start-recording', (req, res) => {
     const outputPath = path.join(RECORDINGS_DIR, `${recordingId}.mp4`);
     const ffmpeg = spawn('ffmpeg', ['-rtsp_transport', 'tcp', '-i', rtspUrl, '-t', String(durationSeconds), '-c', 'copy', outputPath], { stdio: ['ignore', 'ignore', 'pipe'] });
 
-    const rec = { id: recordingId, recordingId, status: 'recording', outputPath, fileSize: null, processRef: ffmpeg, ffmpegStderr: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: req.body.prompt || '', cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+    const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: req.body.prompt || '', cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
     recordings.set(recordingId, rec);
 
     ffmpeg.on('close', async (code) => {
       rec.finishedAt = new Date().toISOString();
       if (code !== 0) return void (rec.status = 'failed', rec.error = `FFmpeg encerrou com código ${code}`);
-      if (!fs.existsSync(rec.outputPath)) return void (rec.status = 'failed', rec.error = 'Arquivo de saída não foi criado.');
-      rec.fileSize = fs.statSync(rec.outputPath).size;
-      if (rec.fileSize < MIN_FILE_SIZE_BYTES) return void (rec.status = 'failed', rec.error = `Arquivo muito pequeno (${rec.fileSize} bytes).`);
+      rec.status = 'validating_video';
+      const validation = await validateVideoFile(rec.outputPath);
+      rec.videoValidation = validation;
+      rec.fileSize = validation.fileSize || null;
+      if (!validation.valid) {
+        rec.status = 'failed';
+        rec.failedStage = 'validating_video';
+        rec.error = validation.error || 'Falha na validação do vídeo.';
+        return;
+      }
       await finalizeRecording(recordingId);
     });
     ffmpeg.on('error', (error) => { rec.status = 'failed'; rec.error = `Falha ao iniciar FFmpeg: ${error.message}`; });
@@ -166,7 +221,7 @@ app.post('/stop-recording/:recordingId', (req, res) => {
 app.get('/recording-status/:recordingId', (req, res) => {
   const rec = recordings.get(req.params.recordingId);
   if (!rec) return res.status(404).json({ error: 'not_found' });
-  return res.json({ status: rec.status, error: rec.error, fileSize: rec.fileSize, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, railwayResponse: rec.railwayResponse });
+  return res.json({ id: rec.id, status: rec.status, failedStage: rec.failedStage, error: rec.error, outputPath: rec.outputPath, fileSize: rec.fileSize, videoValidation: rec.videoValidation, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, railwayResponse: rec.railwayResponse });
 });
 
 app.listen(PORT, () => console.log(`Agent local rodando na porta ${PORT}`));
