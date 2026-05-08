@@ -13,6 +13,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "ffprobe-static": "^3.1.0",
     "googleapis": "^144.0.0",
     "pdfkit": "^0.15.0",
     "@google-cloud/storage": "^7.16.0"

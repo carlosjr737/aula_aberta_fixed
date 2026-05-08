@@ -3,16 +3,22 @@ const cors = require('cors');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
 const { uploadFileToGCS, generateSignedReadUrl } = require('./services/gcsStorage');
+let ffprobePath = 'ffprobe';
+try { ffprobePath = require('ffprobe-static').path || 'ffprobe'; } catch (_error) { ffprobePath = 'ffprobe'; }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
+const MIN_VALIDATION_FILE_SIZE_BYTES = 50 * 1024;
+const FFPROBE_FALLBACK_FILE_SIZE_BYTES = 100 * 1024;
 const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
 
 app.use(cors({ origin: true }));
@@ -22,6 +28,37 @@ function extractDriveFileId(input) { if (!input) return null; if (/^[a-zA-Z0-9_-
 function getDriveClientRO() { const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive.readonly'] }); return google.drive({ version: 'v3', auth }); }
 async function downloadFromDrive(fileId, destPath) { const drive = getDriveClientRO(); const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
 async function downloadFromUrl(url, destPath) { const response = await fetch(url); if (!response.ok) throw new Error(`Falha ao baixar vídeo URL: ${response.status}`); await pipeline(response.body, fs.createWriteStream(destPath)); }
+async function validateVideoFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return { valid: false, fileSize: 0, error: 'Arquivo não encontrado.' };
+  const fileSize = fs.statSync(filePath).size;
+  if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo inválido (${fileSize} bytes).` };
+
+  try {
+    const { stdout } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    const probe = JSON.parse(stdout || '{}');
+    const streams = Array.isArray(probe.streams) ? probe.streams : [];
+    const videoStream = streams.find((stream) => stream.codec_type === 'video');
+    if (!videoStream) return { valid: false, fileSize, error: 'Arquivo inválido: stream de vídeo não encontrada.' };
+    const audioStream = streams.find((stream) => stream.codec_type === 'audio');
+    const durationRaw = videoStream.duration || probe?.format?.duration || 0;
+    const duration = Number(durationRaw) || 0;
+    return { valid: true, fileSize, duration, codec: videoStream.codec_name || null, width: Number(videoStream.width) || null, height: Number(videoStream.height) || null, hasAudio: Boolean(audioStream) };
+  } catch (_error) {
+    if (fileSize >= FFPROBE_FALLBACK_FILE_SIZE_BYTES) {
+      return {
+        valid: true,
+        fileSize,
+        duration: null,
+        codec: null,
+        width: null,
+        height: null,
+        hasAudio: null,
+        warning: 'ffprobe falhou no backend, mas arquivo tem tamanho suficiente para continuar.'
+      };
+    }
+    return { valid: false, fileSize, error: 'Falha ao validar vídeo com ffprobe.' };
+  }
+}
 
 app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
@@ -61,11 +98,13 @@ app.post('/analyze-video-url', async (req, res) => {
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl é obrigatório.' });
     videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}.mp4`);
     await downloadFromUrl(videoUrl, videoPath);
-    if (!fs.existsSync(videoPath)) return res.status(400).json({ error: 'Arquivo de vídeo não foi baixado corretamente.' });
-    const size = fs.statSync(videoPath).size;
-    if (size < MIN_FILE_SIZE_BYTES) return res.status(400).json({ error: `Arquivo inválido (${size} bytes).` });
-    return res.json(await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName }));
-  } catch (error) { return res.status(500).json({ error: error.message }); }
+    const videoValidation = await validateVideoFile(videoPath);
+    if (!videoValidation.valid) {
+      return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
+    }
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName });
+    return res.json({ status: 'completed', videoValidation, analysis });
+  } catch (error) { return res.status(500).json({ error: error.message, failedStage: 'validating_video_backend', fileSize: videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : 0, videoValidation: null }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
 
@@ -77,9 +116,10 @@ app.post('/analyze-drive', async (req, res) => {
     if (!finalFileId) return res.status(400).json({ error: 'É necessário enviar driveFileId, fileId ou driveUrl válidos.' });
     videoPath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${finalFileId}.mp4`);
     await downloadFromDrive(finalFileId, videoPath);
-    const size = fs.statSync(videoPath).size;
-    if (size < MIN_FILE_SIZE_BYTES) return res.status(400).json({ error: 'Arquivo inválido' });
-    return res.json(await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt }));
+    const videoValidation = await validateVideoFile(videoPath);
+    if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt });
+    return res.json({ status: 'completed', videoValidation, analysis });
   } catch (error) { return res.status(500).json({ error: error.message }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
