@@ -54,3 +54,9 @@ curl -X POST http://localhost:4000/start-recording \
 
 ## Observação sobre validação de vídeo RTSP
 Vídeos de câmeras RTSP em baixa resolução/bitrate podem ser pequenos. A validação correta é por ffprobe, não apenas por tamanho.
+
+## Railway: garantir ffprobe disponível no backend
+Se o backend Railway não tiver `ffprobe`, você pode usar uma destas abordagens:
+1. **Dockerfile com ffmpeg/ffprobe instalado** (recomendado para previsibilidade).
+2. **Dependências Node com binário embutido** (`ffmpeg-static`/`ffprobe-static`).
+3. **Fallback por tamanho no backend** (já implementado): se `ffprobe` falhar, arquivos com tamanho >= 100 KB seguem para análise, com warning em `videoValidation`.

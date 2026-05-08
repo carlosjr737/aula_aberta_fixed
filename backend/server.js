@@ -3,6 +3,8 @@ const cors = require('cors');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
@@ -13,7 +15,10 @@ const { uploadFileToGCS, generateSignedReadUrl } = require('./services/gcsStorag
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024;
+const MIN_VALIDATION_SIZE_BYTES = 50 * 1024;
+const FFPROBE_FALLBACK_SIZE_BYTES = 100 * 1024;
 const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
+const execFileAsync = promisify(execFile);
 
 app.use(cors({ origin: true }));
 app.use(express.json());
@@ -22,6 +27,41 @@ function extractDriveFileId(input) { if (!input) return null; if (/^[a-zA-Z0-9_-
 function getDriveClientRO() { const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive.readonly'] }); return google.drive({ version: 'v3', auth }); }
 async function downloadFromDrive(fileId, destPath) { const drive = getDriveClientRO(); const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
 async function downloadFromUrl(url, destPath) { const response = await fetch(url); if (!response.ok) throw new Error(`Falha ao baixar vídeo URL: ${response.status}`); await pipeline(response.body, fs.createWriteStream(destPath)); }
+
+async function validateVideoFile(filePath) {
+  if (!fs.existsSync(filePath)) return { valid: false, error: 'Arquivo não encontrado no backend.' };
+
+  const fileSize = fs.statSync(filePath).size;
+  if (fileSize < MIN_VALIDATION_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo inválido (${fileSize} bytes).` };
+
+  try {
+    const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    const parsed = JSON.parse(stdout || '{}');
+    const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+    const videoStream = streams.find((stream) => stream.codec_type === 'video');
+    const audioStream = streams.find((stream) => stream.codec_type === 'audio');
+
+    const validation = {
+      valid: Boolean(videoStream),
+      fileSize,
+      duration: parsed?.format?.duration ? Number(parsed.format.duration) : null,
+      codec: videoStream?.codec_name || null,
+      width: videoStream?.width || null,
+      height: videoStream?.height || null,
+      hasAudio: Boolean(audioStream),
+    };
+
+    console.log('[analyze-video-url] Resultado ffprobe:', validation);
+    if (!validation.valid) return { ...validation, error: 'Arquivo sem stream de vídeo detectável.' };
+    return validation;
+  } catch (error) {
+    const canFallbackBySize = fileSize >= FFPROBE_FALLBACK_SIZE_BYTES;
+    const warning = 'ffprobe falhou no backend, mas arquivo tem tamanho suficiente.';
+    const validation = { valid: canFallbackBySize, fileSize, duration: null, codec: null, width: null, height: null, hasAudio: null };
+    if (canFallbackBySize) return { ...validation, warning };
+    return { ...validation, error: `Falha ao validar vídeo com ffprobe: ${error.message}` };
+  }
+}
 
 app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
@@ -56,16 +96,33 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, professor, turma,
 
 app.post('/analyze-video-url', async (req, res) => {
   let videoPath = null;
+  let videoValidation = null;
   try {
     const { videoUrl, gcsBucket = '', gcsFileName = '', professor = '', turma = '', nivel = '', sala = '', horario = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl é obrigatório.' });
     videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}.mp4`);
+    console.log('[analyze-video-url] Iniciando download da videoUrl.');
+    console.log(`[analyze-video-url] Arquivo temporário: ${videoPath}`);
     await downloadFromUrl(videoUrl, videoPath);
     if (!fs.existsSync(videoPath)) return res.status(400).json({ error: 'Arquivo de vídeo não foi baixado corretamente.' });
-    const size = fs.statSync(videoPath).size;
-    if (size < MIN_FILE_SIZE_BYTES) return res.status(400).json({ error: `Arquivo inválido (${size} bytes).` });
-    return res.json(await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName }));
-  } catch (error) { return res.status(500).json({ error: error.message }); }
+    console.log(`[analyze-video-url] Tamanho do arquivo baixado: ${fs.statSync(videoPath).size} bytes`);
+
+    videoValidation = await validateVideoFile(videoPath);
+    if (!videoValidation.valid) {
+      return res.status(400).json({
+        status: 'error',
+        failedStage: 'video_validation',
+        videoValidation,
+        error: videoValidation.error || 'Arquivo inválido.',
+      });
+    }
+
+    console.log('[analyze-video-url] Iniciando análise Gemini.');
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName });
+    return res.json({ status: 'success', videoValidation, analysis });
+  } catch (error) {
+    return res.status(500).json({ status: 'error', failedStage: 'calling_railway', videoValidation, error: error.message });
+  }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
 
