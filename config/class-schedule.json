@@ -1,0 +1,16 @@
+{
+  "date": "2026-05-13",
+  "timezone": "America/Sao_Paulo",
+  "classes": [
+    {
+      "id": "sala1-1400",
+      "cameraId": "sala1",
+      "start": "14:00",
+      "durationMinutes": 60,
+      "professor": "Ruan Lopes",
+      "modalidade": "Danças Urbanas",
+      "turma": "Juvenil",
+      "nivel": "Intermediário"
+    }
+  ]
+}

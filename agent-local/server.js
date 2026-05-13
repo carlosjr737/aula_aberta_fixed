@@ -75,6 +75,7 @@ const app = express();
 const RAILWAY_API_URL = String(process.env.RAILWAY_API_URL || '').replace(/\/$/, '');
 const PORT = Number(process.env.PORT || 4000);
 const RECORDINGS_DIR = path.join(__dirname, 'recordings');
+const SCHEDULE_PATH = path.join(__dirname, '..', 'config', 'class-schedule.json');
 const MIN_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_MIN_BYTES = 100 * 1024;
 const CLEANUP_LOCAL_FILES = false;
@@ -95,6 +96,14 @@ fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY };
 const recordings = new Map();
+const dailyScheduleState = {
+  started: false,
+  sourcePath: SCHEDULE_PATH,
+  scheduleDate: null,
+  timezone: null,
+  classes: new Map(),
+  timers: new Map()
+};
 
 app.use(cors({ origin: 'https://aula-aberta-fixed.vercel.app', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'ngrok-skip-browser-warning'] }));
 app.options('*', cors());
@@ -139,6 +148,67 @@ async function finalizeRecording(recordingId) {
     rec.error = error.message;
   } finally {
     if (CLEANUP_LOCAL_FILES && fs.existsSync(rec.outputPath)) fs.unlinkSync(rec.outputPath);
+  }
+}
+
+function slugifyText(text) {
+  return String(text || '').trim().replace(/\s+/g, '-').replace(/[^a-zA-Z0-9\-_]/g, '');
+}
+
+function parseTimeString(start) {
+  const match = String(start || '').match(/^(\d{2}):(\d{2})$/);
+  if (!match) throw new Error(`Horário inválido: ${start}`);
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) throw new Error(`Horário inválido: ${start}`);
+  return { hour, minute };
+}
+
+function getTimeZoneOffsetMillis(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  });
+  const parts = dtf.formatToParts(date).reduce((acc, part) => (acc[part.type] = part.value, acc), {});
+  const asUTC = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
+  return asUTC - date.getTime();
+}
+
+function zonedDateTimeToUtc(dateText, start, timeZone) {
+  const [year, month, day] = String(dateText).split('-').map(Number);
+  const { hour, minute } = parseTimeString(start);
+  const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0));
+  const offset = getTimeZoneOffsetMillis(guess, timeZone);
+  return new Date(guess.getTime() - offset);
+}
+
+function buildGeminiPrompt(classItem, dnaText, standardPrompt) {
+  return `[DNA DO PROFESSOR DK]\n${dnaText}\n\n[CONTEXTO DA AULA]\nProfessor: ${classItem.professor || ''}\nModalidade: ${classItem.modalidade || ''}\nTurma: ${classItem.turma || ''}\nNível: ${classItem.nivel || ''}\nDuração analisada: ${classItem.durationMinutes} minutos\nSala/Câmera: ${classItem.cameraId}\nData: ${classItem.date}\nHorário de início: ${classItem.start}\n\n[PROMPT PADRÃO DE AVALIAÇÃO]\n${standardPrompt}`;
+}
+
+async function processRecordingInBackground(classItem) {
+  const status = dailyScheduleState.classes.get(classItem.id);
+  if (!status) return;
+  try {
+    console.log(`[schedule:${classItem.id}] Início upload/análise`);
+    status.analysisStatus = 'pending_analysis';
+    status.recordingStatus = 'recorded';
+    status.analysisStatus = 'uploading';
+    const rec = recordings.get(classItem.recordingId);
+    await finalizeRecording(classItem.recordingId);
+    status.videoPath = rec?.outputPath || status.videoPath;
+    status.videoUrl = rec?.videoUrl || null;
+    status.analysisStatus = 'analyzing';
+    if (rec?.status === 'failed') throw new Error(rec.error || 'Falha no upload/análise');
+    status.analysisStatus = 'generating_pdf';
+    status.reportUrl = rec?.railwayResponse?.analysis?.pdfUrl || rec?.railwayResponse?.pdfUrl || null;
+    status.analysisStatus = 'completed';
+    console.log(`[schedule:${classItem.id}] Fim da análise`);
+  } catch (error) {
+    status.analysisStatus = 'analysis_failed';
+    status.error = error.message;
+    console.error(`[schedule:${classItem.id}] Erro de análise: ${error.message}`);
   }
 }
 
@@ -276,8 +346,7 @@ app.post('/start-recording', (req, res) => {
         rec.error = validation.reason || validation.error || 'Falha na validação do vídeo.';
         return;
       }
-      console.log(`[recording:${recordingId}] Vídeo válido. Prosseguindo para upload/análise.`);
-      await finalizeRecording(recordingId);
+      console.log(`[recording:${recordingId}] Vídeo válido.`);
     });
     ffmpeg.on('error', (error) => {
       rec.status = 'failed';
@@ -287,6 +356,113 @@ app.post('/start-recording', (req, res) => {
     });
     return res.json({ recordingId, status: rec.status });
   } catch (error) { return res.status(500).json({ error: error.message }); }
+});
+
+app.post('/start-daily-schedule', async (_req, res) => {
+  try {
+    if (dailyScheduleState.started) {
+      return res.json({ started: true, message: 'Scheduler já iniciado.', classes: Array.from(dailyScheduleState.classes.values()) });
+    }
+    if (!fs.existsSync(SCHEDULE_PATH)) return res.status(404).json({ error: `Agenda não encontrada em ${SCHEDULE_PATH}` });
+    const raw = fs.readFileSync(SCHEDULE_PATH, 'utf-8');
+    const schedule = JSON.parse(raw);
+    const classes = Array.isArray(schedule.classes) ? schedule.classes : [];
+    const timezone = schedule.timezone || 'America/Sao_Paulo';
+    console.log(`[schedule] Agenda carregada: date=${schedule.date} timezone=${timezone} aulas=${classes.length}`);
+
+    const byCamera = new Map();
+    for (const item of classes) {
+      const durationMinutes = Number(item.durationMinutes || 60);
+      const startAt = zonedDateTimeToUtc(schedule.date, item.start, timezone);
+      const endAt = new Date(startAt.getTime() + durationMinutes * 60000);
+      const key = String(item.cameraId || '').toLowerCase();
+      if (!byCamera.has(key)) byCamera.set(key, []);
+      byCamera.get(key).push({ ...item, durationMinutes, startAt, endAt });
+    }
+    for (const [cameraId, items] of byCamera.entries()) {
+      items.sort((a, b) => a.startAt - b.startAt);
+      for (let i = 1; i < items.length; i += 1) {
+        if (items[i].startAt < items[i - 1].endAt) {
+          return res.status(400).json({ error: `Conflito de gravação na câmera ${cameraId}: ${items[i - 1].id} sobrepõe ${items[i].id}` });
+        }
+      }
+    }
+
+    const dnaText = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'dna-professor-dk.md'), 'utf-8');
+    const standardPrompt = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'prompt-avaliacao-aula.md'), 'utf-8');
+    dailyScheduleState.started = true;
+    dailyScheduleState.scheduleDate = schedule.date;
+    dailyScheduleState.timezone = timezone;
+
+    const scheduled = [];
+    for (const classItem of classes) {
+      const durationMinutes = Number(classItem.durationMinutes || 60);
+      const classStartUtc = zonedDateTimeToUtc(schedule.date, classItem.start, timezone);
+      const timestamp = classItem.start.replace(':', '');
+      const professorSlug = slugifyText(classItem.professor || 'professor');
+      const outputName = `${schedule.date}_${classItem.cameraId}_${timestamp}_${professorSlug}.mp4`;
+      const classStatus = { ...classItem, date: schedule.date, durationMinutes, recordingStatus: 'scheduled', analysisStatus: 'not_started', videoPath: path.join(RECORDINGS_DIR, outputName), videoUrl: null, reportUrl: null, error: null };
+      dailyScheduleState.classes.set(classItem.id, classStatus);
+      scheduled.push(classStatus);
+
+      const delayMs = Math.max(0, classStartUtc.getTime() - Date.now());
+      const timer = setTimeout(() => {
+        (async () => {
+          const status = dailyScheduleState.classes.get(classItem.id);
+          if (!status || status.recordingStatus === 'recording') return;
+          status.recordingStatus = 'recording';
+          console.log(`[schedule:${classItem.id}] Início da gravação`);
+          const rtspUrl = CAMERAS[String(classItem.cameraId || '').toLowerCase()];
+          if (!rtspUrl) {
+            status.recordingStatus = 'record_failed';
+            status.analysisStatus = 'analysis_failed';
+            status.error = `RTSP não configurado para ${classItem.cameraId}`;
+            return;
+          }
+          const recordingId = crypto.randomUUID();
+          status.recordingId = recordingId;
+          const outputPath = status.videoPath;
+          const durationSeconds = Math.floor(durationMinutes * 60);
+          const ffmpegArgs = ['-hide_banner', '-y', '-nostdin', '-rtsp_transport', 'tcp', '-fflags', '+genpts+discardcorrupt', '-use_wallclock_as_timestamps', '1', '-i', rtspUrl, '-t', String(durationSeconds), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'fps=10,scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '64k', '-ar', '16000', '-ac', '1', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', outputPath];
+          const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+          const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: classItem.professor || '', turma: classItem.turma || '', nivel: classItem.nivel || '', sala: classItem.cameraId || '', horario: classItem.start || '', prompt: buildGeminiPrompt({ ...classItem, date: schedule.date, durationMinutes }, dnaText, standardPrompt), cameraId: classItem.cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+          recordings.set(recordingId, rec);
+          ffmpeg.stderr.on('data', (chunk) => { rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, chunk, MAX_FFMPEG_LOG_CHARS); });
+          ffmpeg.on('close', async (code) => {
+            console.log(`[schedule:${classItem.id}] Fim da gravação código=${code}`);
+            if (code !== 0) {
+              status.recordingStatus = 'record_failed';
+              status.error = `FFmpeg encerrou com código ${code}`;
+              return;
+            }
+            const validation = await validateVideoFile(outputPath, durationSeconds);
+            if (!validation.valid) {
+              status.recordingStatus = 'record_failed';
+              status.analysisStatus = 'analysis_failed';
+              status.error = validation.reason || validation.error || 'Falha na validação do vídeo';
+              return;
+            }
+            processRecordingInBackground({ ...classItem, recordingId }).catch((error) => console.error(`[schedule:${classItem.id}] Erro assíncrono: ${error.message}`));
+          });
+          ffmpeg.on('error', (error) => {
+            status.recordingStatus = 'record_failed';
+            status.error = `Falha ao iniciar FFmpeg: ${error.message}`;
+            console.error(`[schedule:${classItem.id}] Erro de gravação: ${error.message}`);
+          });
+        })();
+      }, delayMs);
+
+      dailyScheduleState.timers.set(classItem.id, timer);
+      console.log(`[schedule:${classItem.id}] Aula agendada para ${classItem.start} (${classStartUtc.toISOString()})`);
+    }
+    return res.json({ started: true, classes: scheduled });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/daily-schedule-status', (_req, res) => {
+  return res.json({ started: dailyScheduleState.started, date: dailyScheduleState.scheduleDate, timezone: dailyScheduleState.timezone, classes: Array.from(dailyScheduleState.classes.values()) });
 });
 
 app.post('/stop-recording/:recordingId', (req, res) => {
