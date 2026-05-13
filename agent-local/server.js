@@ -120,6 +120,39 @@ async function uploadVideoToDrive(filePath) {
   return res.data;
 }
 
+
+async function ensureDriveFolder(drive, name, parentId) {
+  const q = [`mimeType='application/vnd.google-apps.folder'`, `name='${name.replace(/'/g, "\'")}'`, 'trashed=false'];
+  if (parentId) q.push(`'${parentId}' in parents`);
+  const list = await drive.files.list({ q: q.join(' and '), fields: 'files(id,name)', supportsAllDrives: true, includeItemsFromAllDrives: true });
+  if (list.data.files?.length) return list.data.files[0].id;
+  const created = await drive.files.create({ requestBody: { name, mimeType: 'application/vnd.google-apps.folder', parents: parentId ? [parentId] : undefined }, fields: 'id', supportsAllDrives: true });
+  return created.data.id;
+}
+
+async function saveReportArtifacts(rec) {
+  const now = new Date();
+  const y = String(now.getUTCFullYear());
+  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const date = (rec.horarioAgendadoDate || now.toISOString().slice(0,10)).replace(/:/g,'-');
+  const time = (rec.horario || '').replace(':','-') || now.toISOString().slice(11,16).replace(':','-');
+  const turma = slugifyText(rec.turma || 'turma');
+  const base = `${date}_${time}_${turma}_${rec.recordingId}`;
+  const reportObj = { recordingId: rec.recordingId, professor: rec.professor, modalidade: rec.modalidade || '', turma: rec.turma, faixaEtaria: rec.faixaEtaria || '', nivel: rec.nivel, sala: rec.sala, cameraId: rec.cameraId, horarioAgendado: rec.horario || '', recordingStartedAt: rec.startedAt, recordingEndedAt: rec.finishedAt, videoGcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, promptFinalUsado: rec.prompt, respostaIA: rec.railwayResponse, pdfUrl: rec?.railwayResponse?.analysis?.pdfUrl || rec?.railwayResponse?.pdfUrl || null, createdAt: now.toISOString() };
+  const jsonPath = path.join(RECORDINGS_DIR, `${base}.json`);
+  fs.writeFileSync(jsonPath, JSON.stringify(reportObj, null, 2));
+  rec.jsonLocalPath = jsonPath;
+  try {
+    const drive = getDriveClient();
+    const root = await ensureDriveFolder(drive, 'DK IA');
+    const rel = await ensureDriveFolder(drive, 'Relatorios', root);
+    const fy = await ensureDriveFolder(drive, y, rel);
+    const fm = await ensureDriveFolder(drive, m, fy);
+    const fp = await ensureDriveFolder(drive, slugifyText(rec.professor || 'Professor'), fm);
+    const jsonUploaded = await drive.files.create({ requestBody: { name: `${base}.json`, parents: [fp] }, media: { mimeType: 'application/json', body: fs.createReadStream(jsonPath) }, fields: 'id,webViewLink', supportsAllDrives: true });
+    rec.jsonUrl = jsonUploaded.data.webViewLink;
+  } catch (e) { rec.jsonSaveError = e.message; }
+}
 async function finalizeRecording(recordingId) {
   const rec = recordings.get(recordingId);
   if (!rec) return;
@@ -141,6 +174,7 @@ async function finalizeRecording(recordingId) {
     rec.railwayResponse = payload;
     if (!response.ok) throw new Error(payload.error || 'Falha ao analisar no Railway');
     rec.report = payload;
+    await saveReportArtifacts(rec);
     rec.status = 'completed';
   } catch (error) {
     rec.status = 'failed';
@@ -184,7 +218,8 @@ function zonedDateTimeToUtc(dateText, start, timeZone) {
 }
 
 function buildGeminiPrompt(classItem, dnaText, standardPrompt) {
-  return `[DNA DO PROFESSOR DK]\n${dnaText}\n\n[CONTEXTO DA AULA]\nProfessor: ${classItem.professor || ''}\nModalidade: ${classItem.modalidade || ''}\nTurma: ${classItem.turma || ''}\nNível: ${classItem.nivel || ''}\nDuração analisada: ${classItem.durationMinutes} minutos\nSala/Câmera: ${classItem.cameraId}\nData: ${classItem.date}\nHorário de início: ${classItem.start}\n\n[PROMPT PADRÃO DE AVALIAÇÃO]\n${standardPrompt}`;
+  const observacoes = classItem.observacoes || classItem.prompt || '';
+  return `[DNA DO PROFESSOR DK - FIXO]\n${dnaText}\n\n[CONTEXTO DA AULA]\nProfessor: ${classItem.professor || ''}\nModalidade: ${classItem.modalidade || ''}\nTurma: ${classItem.turma || ''}\nFaixa etária: ${classItem.faixaEtaria || ''}\nNível: ${classItem.nivel || ''}\nTipo de aula: ${classItem.tipoAula || ''}\nSala: ${classItem.sala || ''}\nCâmera: ${classItem.cameraId}\nData: ${classItem.date || ''}\nHorário de início: ${classItem.start || classItem.horario || ''}\nDuração: ${classItem.durationMinutes || ''} minutos\n\n[OBSERVAÇÕES ESPECÍFICAS DA ANÁLISE]\n${observacoes}\n\n[ESTRUTURA OBRIGATÓRIA DO RELATÓRIO]\n${standardPrompt}`;
 }
 
 async function processRecordingInBackground(classItem) {
@@ -192,21 +227,19 @@ async function processRecordingInBackground(classItem) {
   if (!status) return;
   try {
     console.log(`[schedule:${classItem.id}] Início upload/análise`);
-    status.analysisStatus = 'pending_analysis';
-    status.recordingStatus = 'recorded';
-    status.analysisStatus = 'uploading';
+    status.analysisStatus = 'uploading_gcs'; status.uiStatus = 'uploading_gcs';
     const rec = recordings.get(classItem.recordingId);
     await finalizeRecording(classItem.recordingId);
     status.videoPath = rec?.outputPath || status.videoPath;
     status.videoUrl = rec?.videoUrl || null;
-    status.analysisStatus = 'analyzing';
+    status.analysisStatus = 'analyzing'; status.uiStatus = 'analyzing';
     if (rec?.status === 'failed') throw new Error(rec.error || 'Falha no upload/análise');
     status.analysisStatus = 'generating_pdf';
     status.reportUrl = rec?.railwayResponse?.analysis?.pdfUrl || rec?.railwayResponse?.pdfUrl || null;
-    status.analysisStatus = 'completed';
+    status.analysisStatus = 'completed'; status.uiStatus = 'completed';
     console.log(`[schedule:${classItem.id}] Fim da análise`);
   } catch (error) {
-    status.analysisStatus = 'analysis_failed';
+    status.analysisStatus = 'failed'; status.uiStatus = 'failed';
     status.error = error.message;
     console.error(`[schedule:${classItem.id}] Erro de análise: ${error.message}`);
   }
@@ -286,6 +319,9 @@ app.post('/start-recording', (req, res) => {
     if (!rtspUrl) return res.status(400).json({ error: 'RTSP não configurado para esta câmera', cameraId, availableCameras: Object.keys(CAMERAS) });
     if (!RAILWAY_API_URL) return res.status(500).json({ error: 'RAILWAY_API_URL não configurada.' });
 
+    const dnaText = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'dna-professor-dk.md'), 'utf-8');
+    const standardPrompt = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'prompt-avaliacao-aula.md'), 'utf-8');
+
     const durationSeconds = Math.floor(Math.max(1, Number(req.body.durationMinutes || 60)) * 60);
     const recordingId = crypto.randomUUID();
     const outputPath = path.join(RECORDINGS_DIR, `${recordingId}.mp4`);
@@ -317,7 +353,8 @@ app.post('/start-recording', (req, res) => {
     console.log(`[recording:${recordingId}] FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
     const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 
-    const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: req.body.prompt || '', cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+    const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: '', cameraId, observacoes: req.body.observacoes || req.body.prompt || '', startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+    rec.prompt = buildGeminiPrompt({ ...req.body, cameraId, durationMinutes: Number(req.body.durationMinutes || 60), date: new Date().toISOString().slice(0,10), start: req.body.horario || '' }, dnaText, standardPrompt);
     recordings.set(recordingId, rec);
 
     ffmpeg.stderr.on('data', (chunk) => {
@@ -347,6 +384,8 @@ app.post('/start-recording', (req, res) => {
         return;
       }
       console.log(`[recording:${recordingId}] Vídeo válido.`);
+      rec.status = 'uploading_gcs';
+      finalizeRecording(recordingId).catch((error) => { rec.status = 'failed'; rec.error = error.message; rec.failedStage = 'calling_railway'; });
     });
     ffmpeg.on('error', (error) => {
       rec.status = 'failed';
@@ -401,7 +440,7 @@ app.post('/start-daily-schedule', async (_req, res) => {
       const timestamp = classItem.start.replace(':', '');
       const professorSlug = slugifyText(classItem.professor || 'professor');
       const outputName = `${schedule.date}_${classItem.cameraId}_${timestamp}_${professorSlug}.mp4`;
-      const classStatus = { ...classItem, date: schedule.date, durationMinutes, recordingStatus: 'scheduled', analysisStatus: 'not_started', videoPath: path.join(RECORDINGS_DIR, outputName), videoUrl: null, reportUrl: null, error: null };
+      const classStatus = { ...classItem, date: schedule.date, durationMinutes, recordingStatus: 'agendada', analysisStatus: 'aguardando', uiStatus: 'agendada', videoPath: path.join(RECORDINGS_DIR, outputName), videoUrl: null, reportUrl: null, error: null };
       dailyScheduleState.classes.set(classItem.id, classStatus);
       scheduled.push(classStatus);
 
@@ -410,12 +449,12 @@ app.post('/start-daily-schedule', async (_req, res) => {
         (async () => {
           const status = dailyScheduleState.classes.get(classItem.id);
           if (!status || status.recordingStatus === 'recording') return;
-          status.recordingStatus = 'recording';
+          status.recordingStatus = 'gravando'; status.uiStatus = 'gravando';
           console.log(`[schedule:${classItem.id}] Início da gravação`);
           const rtspUrl = CAMERAS[String(classItem.cameraId || '').toLowerCase()];
           if (!rtspUrl) {
             status.recordingStatus = 'record_failed';
-            status.analysisStatus = 'analysis_failed';
+            status.analysisStatus = 'failed'; status.uiStatus = 'failed';
             status.error = `RTSP não configurado para ${classItem.cameraId}`;
             return;
           }
@@ -425,8 +464,8 @@ app.post('/start-daily-schedule', async (_req, res) => {
           const durationSeconds = Math.floor(durationMinutes * 60);
           const ffmpegArgs = ['-hide_banner', '-y', '-nostdin', '-rtsp_transport', 'tcp', '-fflags', '+genpts+discardcorrupt', '-use_wallclock_as_timestamps', '1', '-i', rtspUrl, '-t', String(durationSeconds), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'fps=10,scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '64k', '-ar', '16000', '-ac', '1', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', outputPath];
           const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
-          const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: classItem.professor || '', turma: classItem.turma || '', nivel: classItem.nivel || '', sala: classItem.cameraId || '', horario: classItem.start || '', prompt: buildGeminiPrompt({ ...classItem, date: schedule.date, durationMinutes }, dnaText, standardPrompt), cameraId: classItem.cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
-          recordings.set(recordingId, rec);
+          const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: classItem.professor || '', turma: classItem.turma || '', nivel: classItem.nivel || '', sala: classItem.sala || classItem.cameraId || '', horario: classItem.start || '', prompt: buildGeminiPrompt({ ...classItem, date: schedule.date, durationMinutes }, dnaText, standardPrompt), cameraId: classItem.cameraId, observacoes: classItem.observacoes || '', startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+    recordings.set(recordingId, rec);
           ffmpeg.stderr.on('data', (chunk) => { rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, chunk, MAX_FFMPEG_LOG_CHARS); });
           ffmpeg.on('close', async (code) => {
             console.log(`[schedule:${classItem.id}] Fim da gravação código=${code}`);
@@ -438,7 +477,7 @@ app.post('/start-daily-schedule', async (_req, res) => {
             const validation = await validateVideoFile(outputPath, durationSeconds);
             if (!validation.valid) {
               status.recordingStatus = 'record_failed';
-              status.analysisStatus = 'analysis_failed';
+              status.analysisStatus = 'failed'; status.uiStatus = 'failed';
               status.error = validation.reason || validation.error || 'Falha na validação do vídeo';
               return;
             }
@@ -476,7 +515,7 @@ app.post('/stop-recording/:recordingId', (req, res) => {
 app.get('/recording-status/:recordingId', (req, res) => {
   const rec = recordings.get(req.params.recordingId);
   if (!rec) return res.status(404).json({ error: 'not_found' });
-  return res.json({ id: rec.id, status: rec.status, failedStage: rec.failedStage, error: rec.error, ffmpegLastLog: rec.ffmpegLastLog || getLogTail(rec.ffmpegStderr), outputPath: rec.outputPath, fileSize: rec.fileSize, videoValidation: rec.videoValidation, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, railwayResponse: rec.railwayResponse });
+  return res.json({ id: rec.id, status: rec.status, jsonUrl: rec.jsonUrl || null, failedStage: rec.failedStage, error: rec.error, ffmpegLastLog: rec.ffmpegLastLog || getLogTail(rec.ffmpegStderr), outputPath: rec.outputPath, fileSize: rec.fileSize, videoValidation: rec.videoValidation, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, railwayResponse: rec.railwayResponse });
 });
 
 app.listen(PORT, () => console.log(`Agent local rodando na porta ${PORT}`));

@@ -13,3 +13,6 @@ button { border: none; background: #1f6feb; color: white; border-radius: 8px; fo
 button:disabled { opacity: .6; cursor: not-allowed; }
 .status { color: #444; min-height: 22px; }
 pre { white-space: pre-wrap; overflow: auto; background: #f8f8f8; border: 1px solid #e5e5e5; padding: 12px; border-radius: 8px; }
+
+.mini { margin-top:12px; }
+code { background:#eee; padding:2px 6px; border-radius:4px; }

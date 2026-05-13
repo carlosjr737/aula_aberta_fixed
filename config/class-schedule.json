@@ -4,13 +4,19 @@
   "classes": [
     {
       "id": "sala1-1400",
-      "cameraId": "sala1",
+      "date": "2026-05-13",
+      "timezone": "America/Sao_Paulo",
+      "cameraId": "subway",
+      "sala": "Sala 1",
       "start": "14:00",
       "durationMinutes": 60,
       "professor": "Ruan Lopes",
       "modalidade": "Danças Urbanas",
       "turma": "Juvenil",
-      "nivel": "Intermediário"
+      "faixaEtaria": "12-16",
+      "nivel": "Intermediário",
+      "tipoAula": "Técnica",
+      "observacoes": "Foco em didática e energia"
     }
   ]
 }
