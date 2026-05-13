@@ -8,6 +8,7 @@ const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
+const { DNA_PROFESSOR_DK } = require('./prompts/dnaProfessorDK');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
 const { uploadFileToGCS, generateSignedReadUrl } = require('./services/gcsStorage');
@@ -60,14 +61,43 @@ async function validateVideoFile(filePath) {
   }
 }
 
+
+function buildLessonContext({ professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '' }) {
+  return [
+    'CONTEXTO DA AULA:',
+    `- Professor: ${professor || 'Não informado'}`,
+    `- Modalidade: ${modalidade || 'Não informado'}`,
+    `- Turma: ${turma || 'Não informado'}`,
+    `- Faixa etária: ${faixaEtaria || 'Não informado'}`,
+    `- Nível: ${nivel || 'Não informado'}`,
+    `- Sala: ${sala || 'Não informado'}`,
+    `- Horário: ${horario || 'Não informado'}`,
+    `- Duração: ${duracao || 'Não informado'}`,
+    `- Observações: ${observacoes || 'Não informado'}`
+  ].join('\n');
+}
+
+function buildFinalPrompt({ userPrompt = DEFAULT_PROMPT, context }) {
+  return [
+    DNA_PROFESSOR_DK.trim(),
+    '',
+    context.trim(),
+    '',
+    'PROMPT ESPECÍFICO DO USUÁRIO:',
+    userPrompt || DEFAULT_PROMPT
+  ].join('\n');
+}
+
 app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), GCS_BUCKET_NAME: Boolean(process.env.GCS_BUCKET_NAME), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
-async function analyzeFromLocalVideo({ videoPath, recordingId, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt }) {
+async function analyzeFromLocalVideo({ videoPath, recordingId, professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, prompt, cameraId, recordingStartedAt, recordingEndedAt }) {
   const file = await uploadToGemini(videoPath, 'video/mp4');
   const active = await waitForGeminiActive(file.name);
-  const rawResponse = await analyzeVideo(active.uri, prompt, { professor, turma, nivel, sala, horario, cameraId, recordingId });
+  const lessonContext = buildLessonContext({ professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes });
+  const finalPrompt = buildFinalPrompt({ userPrompt: prompt, context: lessonContext });
+  const rawResponse = await analyzeVideo(active.uri, finalPrompt, { professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, cameraId, recordingId });
 
   const reportPayload = { recordingId, professor, turma, nivel, sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
 
@@ -88,13 +118,13 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, professor, turma,
   }
   if (pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
 
-  return { usedRealAI: true, provider: 'gemini', model: GEMINI_MODEL, report: { rawResponse, promptUsado: prompt, metadata: { professor, turma, nivel, sala, horario, cameraId, recordingId }, analyzedAt: new Date().toISOString() }, pdfUrl };
+  return { usedRealAI: true, provider: 'gemini', model: GEMINI_MODEL, report: { rawResponse, promptUsado: finalPrompt, metadata: { professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, cameraId, recordingId }, analyzedAt: new Date().toISOString() }, pdfUrl };
 }
 
 app.post('/analyze-video-url', async (req, res) => {
   let videoPath = null;
   try {
-    const { videoUrl, gcsBucket = '', gcsFileName = '', professor = '', turma = '', nivel = '', sala = '', horario = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
+    const { videoUrl, gcsBucket = '', gcsFileName = '', professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl é obrigatório.' });
     videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}.mp4`);
     await downloadFromUrl(videoUrl, videoPath);
@@ -102,7 +132,7 @@ app.post('/analyze-video-url', async (req, res) => {
     if (!videoValidation.valid) {
       return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
     }
-    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName });
     return res.json({ status: 'completed', videoValidation, analysis });
   } catch (error) { return res.status(500).json({ error: error.message, failedStage: 'validating_video_backend', fileSize: videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : 0, videoValidation: null }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
@@ -111,14 +141,14 @@ app.post('/analyze-video-url', async (req, res) => {
 app.post('/analyze-drive', async (req, res) => {
   let videoPath = null;
   try {
-    const { driveUrl, driveFileId, fileId, professor = '', turma = '', nivel = '', sala = '', horario = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
+    const { driveUrl, driveFileId, fileId, professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
     const finalFileId = extractDriveFileId(driveFileId || fileId || driveUrl || '');
     if (!finalFileId) return res.status(400).json({ error: 'É necessário enviar driveFileId, fileId ou driveUrl válidos.' });
     videoPath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${finalFileId}.mp4`);
     await downloadFromDrive(finalFileId, videoPath);
     const videoValidation = await validateVideoFile(videoPath);
     if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
-    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, professor, turma, nivel, sala, horario, prompt, cameraId, recordingStartedAt, recordingEndedAt });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, prompt, cameraId, recordingStartedAt, recordingEndedAt });
     return res.json({ status: 'completed', videoValidation, analysis });
   } catch (error) { return res.status(500).json({ error: error.message }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }

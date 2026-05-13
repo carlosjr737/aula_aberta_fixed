@@ -101,15 +101,23 @@ function App() {
 
   async function startRecording() {
     if (!LOCAL_AGENT_URL) return setStatus('Configure VITE_LOCAL_AGENT_URL para gravar localmente.');
-    const response = await fetch(`${LOCAL_AGENT_URL}/start-recording`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...NGROK_HEADERS }, body: JSON.stringify({ professor, turma, nivel, sala, horario, durationMinutes, prompt, cameraId: camera }) });
-    const data = await response.json();
-    if (!response.ok) {
-      console.error('Erro ao iniciar gravação', { status: response.status, payload: data });
-      return setStatus(data.error || 'Erro ao iniciar');
+    const startRecordingUrl = `${LOCAL_AGENT_URL}/start-recording`;
+    console.log('URL usada para start-recording:', startRecordingUrl);
+
+    try {
+      const response = await fetch(startRecordingUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', ...NGROK_HEADERS }, body: JSON.stringify({ professor, turma, nivel, sala, horario, durationMinutes, prompt, cameraId: camera }) });
+      const data = await response.json();
+      if (!response.ok) {
+        console.error('Erro ao iniciar gravação', { status: response.status, payload: data, url: startRecordingUrl });
+        return setStatus(data.error || 'Erro ao iniciar gravação: não foi possível conectar ao agent-local/ngrok.');
+      }
+      setRecordingId(data.recordingId);
+      setRecordingStatus('recording');
+      setStatus(`Gravação local iniciada com ID ${data.recordingId}`);
+    } catch (error) {
+      console.error('Erro de conexão ao iniciar gravação', { error, url: startRecordingUrl });
+      setStatus('Erro ao iniciar gravação: não foi possível conectar ao agent-local/ngrok.');
     }
-    setRecordingId(data.recordingId);
-    setRecordingStatus('recording');
-    setStatus(`Gravação local iniciada com ID ${data.recordingId}`);
   }
 
   async function stopRecording() {
