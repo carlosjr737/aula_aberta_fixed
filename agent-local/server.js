@@ -78,6 +78,18 @@ const RECORDINGS_DIR = path.join(__dirname, 'recordings');
 const MIN_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_MIN_BYTES = 100 * 1024;
 const CLEANUP_LOCAL_FILES = false;
+
+const MAX_FFMPEG_LOG_CHARS = 20000;
+
+function appendBoundedLog(currentLog, chunk, maxChars = MAX_FFMPEG_LOG_CHARS) {
+  const nextLog = `${currentLog || ''}${String(chunk || '')}`;
+  return nextLog.length > maxChars ? nextLog.slice(-maxChars) : nextLog;
+}
+
+function getLogTail(log, maxChars = MAX_FFMPEG_LOG_CHARS) {
+  const safeLog = String(log || '');
+  return safeLog.length > maxChars ? safeLog.slice(-maxChars) : safeLog;
+}
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY };
@@ -185,14 +197,24 @@ app.post('/start-recording', (req, res) => {
     const durationSeconds = Math.floor(Math.max(1, Number(req.body.durationMinutes || 60)) * 60);
     const recordingId = crypto.randomUUID();
     const outputPath = path.join(RECORDINGS_DIR, `${recordingId}.mp4`);
-    const ffmpeg = spawn('ffmpeg', ['-rtsp_transport', 'tcp', '-i', rtspUrl, '-t', String(durationSeconds), '-c', 'copy', outputPath], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const ffmpeg = spawn('ffmpeg', ['-hide_banner', '-nostdin', '-rtsp_transport', 'tcp', '-i', rtspUrl, '-t', String(durationSeconds), '-c', 'copy', outputPath], { stdio: ['ignore', 'ignore', 'pipe'] });
 
-    const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: req.body.prompt || '', cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+    const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: req.body.prompt || '', cameraId, startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
     recordings.set(recordingId, rec);
+
+    ffmpeg.stderr.on('data', (chunk) => {
+      rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, chunk, MAX_FFMPEG_LOG_CHARS);
+    });
 
     ffmpeg.on('close', async (code) => {
       rec.finishedAt = new Date().toISOString();
-      if (code !== 0) return void (rec.status = 'failed', rec.error = `FFmpeg encerrou com código ${code}`);
+      if (code !== 0) {
+        rec.status = 'failed';
+        rec.failedStage = 'recording';
+        rec.error = `FFmpeg encerrou com código ${code}`;
+        rec.ffmpegLastLog = getLogTail(rec.ffmpegStderr);
+        return;
+      }
       rec.status = 'validating_video';
       const validation = await validateVideoFile(rec.outputPath);
       rec.videoValidation = validation;
@@ -205,7 +227,12 @@ app.post('/start-recording', (req, res) => {
       }
       await finalizeRecording(recordingId);
     });
-    ffmpeg.on('error', (error) => { rec.status = 'failed'; rec.error = `Falha ao iniciar FFmpeg: ${error.message}`; });
+    ffmpeg.on('error', (error) => {
+      rec.status = 'failed';
+      rec.failedStage = 'starting_ffmpeg';
+      rec.error = `Falha ao iniciar FFmpeg: ${error.message}`;
+      rec.ffmpegLastLog = getLogTail(rec.ffmpegStderr);
+    });
     return res.json({ recordingId, status: rec.status });
   } catch (error) { return res.status(500).json({ error: error.message }); }
 });
@@ -221,7 +248,7 @@ app.post('/stop-recording/:recordingId', (req, res) => {
 app.get('/recording-status/:recordingId', (req, res) => {
   const rec = recordings.get(req.params.recordingId);
   if (!rec) return res.status(404).json({ error: 'not_found' });
-  return res.json({ id: rec.id, status: rec.status, failedStage: rec.failedStage, error: rec.error, outputPath: rec.outputPath, fileSize: rec.fileSize, videoValidation: rec.videoValidation, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, railwayResponse: rec.railwayResponse });
+  return res.json({ id: rec.id, status: rec.status, failedStage: rec.failedStage, error: rec.error, ffmpegLastLog: rec.ffmpegLastLog || getLogTail(rec.ffmpegStderr), outputPath: rec.outputPath, fileSize: rec.fileSize, videoValidation: rec.videoValidation, gcsBucket: rec.gcsBucket, gcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, railwayResponse: rec.railwayResponse });
 });
 
 app.listen(PORT, () => console.log(`Agent local rodando na porta ${PORT}`));
