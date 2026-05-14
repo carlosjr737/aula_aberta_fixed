@@ -4,7 +4,7 @@ import './style.css';
 
 const LOCAL_AGENT_URL = (import.meta.env.VITE_LOCAL_AGENT_URL || '').replace(/\/$/, '');
 const NGROK_HEADERS = { 'ngrok-skip-browser-warning': 'true' };
-const SCHEDULE_STATUSES = ['agendada', 'aguardando', 'gravando', 'validando_video', 'uploading_gcs', 'calling_railway', 'analyzing', 'completed', 'failed'];
+const SCHEDULE_STATUSES = ['agendada', 'aguardando', 'gravando', 'validando_video', 'uploading_gcs', 'calling_railway', 'analyzing', 'completed', 'completed_no_class_detected', 'failed'];
 
 function App() {
   const [tab, setTab] = useState('manual');
@@ -90,7 +90,7 @@ function App() {
       {schedule.map((aula) => <div key={aula.id} className="card mini"><p><strong>{aula.start}</strong> - {aula.professor} / {aula.turma} / {aula.sala || aula.cameraId}</p><p>Status: {aula.uiStatus || aula.recordingStatus || 'agendada'} ({SCHEDULE_STATUSES.join(', ')})</p><button onClick={()=>{ if (confirm('Isso vai ignorar o horário do JSON. Deseja continuar?')) gravarAgora({ ...aula, horario: aula.start, prompt: aula.observacoes || '' }, 'schedule'); }}>Gravar agora esta aula</button></div>)}
     </section>}
 
-    {tab==='reports' && <section className="card"><p>Status gravação: {recordingStatus}</p>{report ? <><p>PDF: {report?.railwayResponse?.pdfUrl ? <a href={report.railwayResponse.pdfUrl} target="_blank">Abrir PDF</a> : '-'}</p><p>JSON: {report?.railwayResponse?.jsonUrl ? <a href={report.railwayResponse.jsonUrl} target="_blank">Abrir JSON</a> : '-'}</p><pre>{JSON.stringify(report, null, 2)}</pre></> : <p>Nenhum relatório ainda.</p>}</section>}
+    {tab==='reports' && <section className="card"><p>Status gravação: {recordingStatus}</p>{report?.status === 'completed_no_class_detected' && <p>Gravação concluída, mas nenhuma aula foi detectada no vídeo.</p>}{report ? <><p>PDF: {report?.drivePdfUrl ? <a href={report.drivePdfUrl} target="_blank">Abrir PDF</a> : '-'}</p><p>JSON: {report?.driveJsonUrl ? <a href={report.driveJsonUrl} target="_blank">Abrir JSON</a> : '-'}</p><pre>{JSON.stringify(report, null, 2)}</pre></> : <p>Nenhum relatório ainda.</p>}</section>}
 
     <section className="card"><p className="status">{status}</p>{errorDetail && <pre>{errorDetail}</pre>}</section>
   </main>;

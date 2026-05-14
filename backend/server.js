@@ -62,44 +62,76 @@ async function validateVideoFile(filePath) {
 }
 
 
-function buildLessonContext({ professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '' }) {
-  return [
-    'CONTEXTO DA AULA:',
-    `- Professor: ${professor || 'Não informado'}`,
-    `- Modalidade: ${modalidade || 'Não informado'}`,
-    `- Turma: ${turma || 'Não informado'}`,
-    `- Faixa etária: ${faixaEtaria || 'Não informado'}`,
-    `- Nível: ${nivel || 'Não informado'}`,
-    `- Sala: ${sala || 'Não informado'}`,
-    `- Horário: ${horario || 'Não informado'}`,
-    `- Duração: ${duracao || 'Não informado'}`,
-    `- Observações: ${observacoes || 'Não informado'}`
-  ].join('\n');
+function normalizeField(...values) {
+  for (const value of values) {
+    const text = String(value ?? '').trim();
+    if (text) return text;
+  }
+  return '';
 }
 
-function buildFinalPrompt({ userPrompt = DEFAULT_PROMPT, context }) {
+function buildClassContext(input = {}) {
+  return {
+    professor: normalizeField(input.professor),
+    modalidade: normalizeField(input.modalidade),
+    turma: normalizeField(input.turma),
+    faixaEtaria: normalizeField(input.faixaEtaria),
+    nivel: normalizeField(input.nivel),
+    tipoAula: normalizeField(input.tipoAula),
+    sala: normalizeField(input.sala),
+    cameraId: normalizeField(input.cameraId),
+    data: normalizeField(input.data, input.date),
+    horarioAgendado: normalizeField(input.horarioAgendado, input.horario, input.start),
+    durationMinutes: normalizeField(input.durationMinutes, input.duracao),
+    observacoes: normalizeField(input.observacoes)
+  };
+}
+
+function buildAnalysisPrompt({ classContext, userNotes = '' }) {
+  const notes = normalizeField(userNotes, classContext.observacoes, DEFAULT_PROMPT);
   return [
     DNA_PROFESSOR_DK.trim(),
     '',
-    context.trim(),
+    'CONTEXTO DA AULA:',
+    `- Professor: ${classContext.professor || 'Não informado'}`,
+    `- Modalidade: ${classContext.modalidade || 'Não informado'}`,
+    `- Turma: ${classContext.turma || 'Não informado'}`,
+    `- Faixa etária: ${classContext.faixaEtaria || 'Não informado'}`,
+    `- Nível: ${classContext.nivel || 'Não informado'}`,
+    `- Tipo de aula: ${classContext.tipoAula || 'Não informado'}`,
+    `- Sala: ${classContext.sala || 'Não informado'}`,
+    `- Câmera: ${classContext.cameraId || 'Não informado'}`,
+    `- Data: ${classContext.data || 'Não informado'}`,
+    `- Horário agendado: ${classContext.horarioAgendado || 'Não informado'}`,
+    `- Duração (min): ${classContext.durationMinutes || 'Não informado'}`,
     '',
-    'PROMPT ESPECÍFICO DO USUÁRIO:',
-    userPrompt || DEFAULT_PROMPT
+    'OBSERVAÇÕES ESPECÍFICAS:',
+    notes,
+    '',
+    'ESTRUTURA OBRIGATÓRIA DO RELATÓRIO: siga estritamente o DNA acima e inclua notas, evidências e próximos passos.'
   ].join('\n');
+}
+
+function detectNoClass(rawResponse = '') {
+  const text = String(rawResponse || '').toLowerCase();
+  const signs = ['sala vazia', 'não há professor', 'nao ha professor', 'não há alunos', 'nao ha alunos', 'não foi possível avaliar', 'nao foi possivel avaliar'];
+  return signs.some((sign) => text.includes(sign));
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), GCS_BUCKET_NAME: Boolean(process.env.GCS_BUCKET_NAME), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
-async function analyzeFromLocalVideo({ videoPath, recordingId, professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, prompt, cameraId, recordingStartedAt, recordingEndedAt }) {
+async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl, signedUrlExpiresAt, videoValidation }) {
   const file = await uploadToGemini(videoPath, 'video/mp4');
   const active = await waitForGeminiActive(file.name);
-  const lessonContext = buildLessonContext({ professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes });
-  const finalPrompt = buildFinalPrompt({ userPrompt: prompt, context: lessonContext });
-  const rawResponse = await analyzeVideo(active.uri, finalPrompt, { professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, cameraId, recordingId });
+  const classContext = buildClassContext({ ...classContextInput, cameraId });
+  const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
+  const rawResponse = await analyzeVideo(active.uri, finalPrompt, { ...classContext, cameraId, recordingId });
+  const noClassDetected = detectNoClass(rawResponse);
+  const status = noClassDetected ? 'completed_no_class_detected' : 'completed';
 
-  const reportPayload = { recordingId, professor, turma, nivel, sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
+  const reportPayload = { recordingId, professor: classContext.professor, turma: classContext.turma, nivel: classContext.nivel, sala: classContext.sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
 
   const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'none').toLowerCase();
   let pdfUrl = null;
@@ -118,7 +150,23 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, professor, modali
   }
   if (pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
 
-  return { usedRealAI: true, provider: 'gemini', model: GEMINI_MODEL, report: { rawResponse, promptUsado: finalPrompt, metadata: { professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, cameraId, recordingId }, analyzedAt: new Date().toISOString() }, pdfUrl };
+  const responsePayload = {
+    status,
+    recordingId,
+    classContext,
+    videoGcsFileName: gcsFileName || recordingId,
+    reportText: rawResponse,
+    localJsonPath: null,
+    localPdfPath: null,
+    drivePdfUrl: null,
+    driveJsonUrl: null,
+    metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
+    video: { gcsFileName: gcsFileName || recordingId, signedUrl: signedUrl || null, signedUrlExpiresAt: signedUrlExpiresAt || null, validation: videoValidation || null },
+    prompt: { dnaVersion: '1.0', promptTemplateVersion: '1.0', userNotes: normalizeField(prompt), finalPromptPreview: finalPrompt.slice(0, 1500) },
+    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status }
+  };
+  if (pdfUrl) responsePayload.drivePdfUrl = pdfUrl;
+  return responsePayload;
 }
 
 app.post('/analyze-video-url', async (req, res) => {
@@ -132,8 +180,8 @@ app.post('/analyze-video-url', async (req, res) => {
     if (!videoValidation.valid) {
       return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
     }
-    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsBucket, gcsFileName });
-    return res.json({ status: 'completed', videoValidation, analysis });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl: videoUrl, videoValidation });
+    return res.json(analysis);
   } catch (error) { return res.status(500).json({ error: error.message, failedStage: 'validating_video_backend', fileSize: videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : 0, videoValidation: null }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
@@ -148,8 +196,8 @@ app.post('/analyze-drive', async (req, res) => {
     await downloadFromDrive(finalFileId, videoPath);
     const videoValidation = await validateVideoFile(videoPath);
     if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
-    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, professor, modalidade, turma, faixaEtaria, nivel, sala, horario, duracao, observacoes, prompt, cameraId, recordingStartedAt, recordingEndedAt });
-    return res.json({ status: 'completed', videoValidation, analysis });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName: finalFileId, videoValidation });
+    return res.json(analysis);
   } catch (error) { return res.status(500).json({ error: error.message }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
