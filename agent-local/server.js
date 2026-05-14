@@ -138,10 +138,21 @@ async function saveReportArtifacts(rec) {
   const time = (rec.horario || '').replace(':','-') || now.toISOString().slice(11,16).replace(':','-');
   const turma = slugifyText(rec.turma || 'turma');
   const base = `${date}_${time}_${turma}_${rec.recordingId}`;
-  const reportObj = { recordingId: rec.recordingId, professor: rec.professor, modalidade: rec.modalidade || '', turma: rec.turma, faixaEtaria: rec.faixaEtaria || '', nivel: rec.nivel, sala: rec.sala, cameraId: rec.cameraId, horarioAgendado: rec.horario || '', recordingStartedAt: rec.startedAt, recordingEndedAt: rec.finishedAt, videoGcsFileName: rec.gcsFileName, videoUrl: rec.videoUrl, promptFinalUsado: rec.prompt, respostaIA: rec.railwayResponse, pdfUrl: rec?.railwayResponse?.analysis?.pdfUrl || rec?.railwayResponse?.pdfUrl || null, createdAt: now.toISOString() };
-  const jsonPath = path.join(RECORDINGS_DIR, `${base}.json`);
+  const recordingDir = path.join(RECORDINGS_DIR, rec.recordingId);
+  fs.mkdirSync(recordingDir, { recursive: true });
+  const reportText = rec?.railwayResponse?.reportText || rec?.railwayResponse?.analysis?.rawResponse || '';
+  const reportObj = {
+    metadata: { recordingId: rec.recordingId, classContext: rec?.railwayResponse?.classContext || {}, recordingStartedAt: rec.startedAt, recordingEndedAt: rec.finishedAt, createdAt: now.toISOString() },
+    video: { gcsFileName: rec.gcsFileName, signedUrl: rec.videoUrl, signedUrlExpiresAt: rec.uploadedAt || null, validation: rec.videoValidation || null },
+    prompt: rec?.railwayResponse?.prompt || {},
+    analysis: rec?.railwayResponse?.analysis || { rawResponse: reportText, status: rec?.railwayResponse?.status || rec.status }
+  };
+  const textPath = path.join(recordingDir, 'analysis.txt');
+  const jsonPath = path.join(recordingDir, 'analysis.json');
+  fs.writeFileSync(textPath, reportText);
   fs.writeFileSync(jsonPath, JSON.stringify(reportObj, null, 2));
   rec.jsonLocalPath = jsonPath;
+  rec.analysisTextPath = textPath;
   try {
     const drive = getDriveClient();
     const root = await ensureDriveFolder(drive, 'DK IA');
@@ -174,8 +185,12 @@ async function finalizeRecording(recordingId) {
     rec.railwayResponse = payload;
     if (!response.ok) throw new Error(payload.error || 'Falha ao analisar no Railway');
     rec.report = payload;
+    rec.localJsonPath = payload.localJsonPath || null;
+    rec.localPdfPath = payload.localPdfPath || null;
+    rec.drivePdfUrl = payload.drivePdfUrl || null;
+    rec.driveJsonUrl = payload.driveJsonUrl || null;
     await saveReportArtifacts(rec);
-    rec.status = 'completed';
+    rec.status = payload.status || 'completed';
   } catch (error) {
     rec.status = 'failed';
     rec.failedStage = currentStage;
@@ -217,9 +232,9 @@ function zonedDateTimeToUtc(dateText, start, timeZone) {
   return new Date(guess.getTime() - offset);
 }
 
-function buildGeminiPrompt(classItem, dnaText, standardPrompt) {
+function buildGeminiPrompt(classItem, _dnaText, standardPrompt) {
   const observacoes = classItem.observacoes || classItem.prompt || '';
-  return `[DNA DO PROFESSOR DK - FIXO]\n${dnaText}\n\n[CONTEXTO DA AULA]\nProfessor: ${classItem.professor || ''}\nModalidade: ${classItem.modalidade || ''}\nTurma: ${classItem.turma || ''}\nFaixa etária: ${classItem.faixaEtaria || ''}\nNível: ${classItem.nivel || ''}\nTipo de aula: ${classItem.tipoAula || ''}\nSala: ${classItem.sala || ''}\nCâmera: ${classItem.cameraId}\nData: ${classItem.date || ''}\nHorário de início: ${classItem.start || classItem.horario || ''}\nDuração: ${classItem.durationMinutes || ''} minutos\n\n[OBSERVAÇÕES ESPECÍFICAS DA ANÁLISE]\n${observacoes}\n\n[ESTRUTURA OBRIGATÓRIA DO RELATÓRIO]\n${standardPrompt}`;
+  return `[CONTEXTO DA AULA]\nProfessor: ${classItem.professor || ''}\nModalidade: ${classItem.modalidade || ''}\nTurma: ${classItem.turma || ''}\nFaixa etária: ${classItem.faixaEtaria || ''}\nNível: ${classItem.nivel || ''}\nTipo de aula: ${classItem.tipoAula || ''}\nSala: ${classItem.sala || ''}\nCâmera: ${classItem.cameraId}\nData: ${classItem.date || ''}\nHorário de início: ${classItem.start || classItem.horario || ''}\nDuração: ${classItem.durationMinutes || ''} minutos\n\n[OBSERVAÇÕES ESPECÍFICAS DA ANÁLISE]\n${observacoes}\n\n[ESTRUTURA OBRIGATÓRIA DO RELATÓRIO]\n${standardPrompt}`;
 }
 
 async function processRecordingInBackground(classItem) {
