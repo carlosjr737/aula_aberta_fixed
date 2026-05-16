@@ -9,6 +9,7 @@ const SCHEDULE_STATUSES = ['agendada', 'aguardando', 'gravando', 'validando_vide
 function App() {
   const [tab, setTab] = useState('manual');
   const [manual, setManual] = useState({ professor: '', modalidade: '', turma: '', faixaEtaria: '', nivel: '', sala: '', cameraId: 'subway', horario: '', durationMinutes: 60, observacoes: '', tipoAula: '' });
+  const fieldLabels = { observacoes: 'Observações específicas' };
   const [status, setStatus] = useState('');
   const [errorDetail, setErrorDetail] = useState('');
   const [recordingId, setRecordingId] = useState('');
@@ -81,7 +82,7 @@ function App() {
     <div className="tabs"><button className={tab==='manual'?'active':''} onClick={()=>setTab('manual')}>Gravação manual</button><button className={tab==='schedule'?'active':''} onClick={()=>setTab('schedule')}>Cronograma</button><button className={tab==='reports'?'active':''} onClick={()=>setTab('reports')}>Relatórios</button></div>
 
     {tab==='manual' && <section className="card">
-      {Object.entries(manual).map(([k,v]) => <label key={k}>{k}<input value={v} onChange={(e)=>setManual((m)=>({...m,[k]:k==='durationMinutes'?Number(e.target.value):e.target.value}))} /></label>)}
+      {Object.entries(manual).map(([k,v]) => <label key={k}>{fieldLabels[k] || k}<input value={v} onChange={(e)=>setManual((m)=>({...m,[k]:k==='durationMinutes'?Number(e.target.value):e.target.value}))} /></label>)}
       <button onClick={()=>gravarAgora({ ...manual, prompt: manual.observacoes })}>Gravar agora</button>
     </section>}
 

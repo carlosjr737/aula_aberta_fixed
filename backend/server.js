@@ -8,7 +8,7 @@ const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
-const { DNA_PROFESSOR_DK } = require('./prompts/dnaProfessorDK');
+const { DNA_PROFESSOR_DK_FULL_OPERATIONAL } = require('./prompts/dnaProfessorDKFullOperational');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
 const { uploadFileToGCS, generateSignedReadUrl } = require('./services/gcsStorage');
@@ -20,7 +20,22 @@ const PORT = process.env.PORT || 3000;
 const execFileAsync = promisify(execFile);
 const MIN_VALIDATION_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_FILE_SIZE_BYTES = 100 * 1024;
-const DEFAULT_PROMPT = 'Analise a aula inteira com foco em didática, energia, correções, clareza e evolução dos alunos.';
+const DEFAULT_PROMPT = 'Observar principalmente autonomia, refinamento e responsabilidade de elenco.';
+
+const REQUIRED_PILLARS = [
+  'Clareza de Objetivo e Direção Pedagógica',
+  'Estrutura e Progressão Didática',
+  'Gestão de Tempo e Ritmo',
+  'Comunicação e Comandos',
+  'Demonstração Técnica e Referência Corporal',
+  'Correção Técnica e Refinamento',
+  'Leitura de Turma e Adaptação',
+  'Autonomia dos Alunos',
+  'Gestão de Energia e Presença de Liderança',
+  'Responsabilidade de Elenco e Ambiente de Aprendizagem',
+  'Musicalidade, Precisão e Coerência Artística',
+  'Evolução Observável ao Longo da Aula'
+];
 
 app.use(cors({ origin: true }));
 app.use(express.json());
@@ -70,27 +85,38 @@ function normalizeField(...values) {
   return '';
 }
 
-function buildClassContext(input = {}) {
+function buildClassContext(input = {}, scheduleFallback = {}) {
+  const source = { ...scheduleFallback, ...input };
   return {
-    professor: normalizeField(input.professor),
-    modalidade: normalizeField(input.modalidade),
-    turma: normalizeField(input.turma),
-    faixaEtaria: normalizeField(input.faixaEtaria),
-    nivel: normalizeField(input.nivel),
-    tipoAula: normalizeField(input.tipoAula),
-    sala: normalizeField(input.sala),
-    cameraId: normalizeField(input.cameraId),
-    data: normalizeField(input.data, input.date),
-    horarioAgendado: normalizeField(input.horarioAgendado, input.horario, input.start),
-    durationMinutes: normalizeField(input.durationMinutes, input.duracao),
-    observacoes: normalizeField(input.observacoes)
+    professor: normalizeField(source.professor),
+    modalidade: normalizeField(source.modalidade),
+    turma: normalizeField(source.turma),
+    faixaEtaria: normalizeField(source.faixaEtaria),
+    nivel: normalizeField(source.nivel),
+    tipoAula: normalizeField(source.tipoAula),
+    sala: normalizeField(source.sala),
+    cameraId: normalizeField(source.cameraId),
+    data: normalizeField(source.data, source.date),
+    horarioAgendado: normalizeField(source.horarioAgendado, source.horario, source.start),
+    durationMinutes: normalizeField(source.durationMinutes, source.duracao),
+    observacoes: normalizeField(source.observacoes)
   };
 }
 
+function validatePromptHasFullDNA(finalPrompt = '') {
+  const missing = REQUIRED_PILLARS.filter((pillar) => !finalPrompt.includes(pillar));
+  if (missing.length) {
+    const error = new Error('Prompt inválido: DNA Professor DK incompleto.');
+    error.statusCode = 400;
+    error.missingPillars = missing;
+    throw error;
+  }
+}
+
 function buildAnalysisPrompt({ classContext, userNotes = '' }) {
-  const notes = normalizeField(userNotes, classContext.observacoes, DEFAULT_PROMPT);
+  const notes = normalizeField(userNotes, DEFAULT_PROMPT);
   return [
-    DNA_PROFESSOR_DK.trim(),
+    DNA_PROFESSOR_DK_FULL_OPERATIONAL.trim(),
     '',
     'CONTEXTO DA AULA:',
     `- Professor: ${classContext.professor || 'Não informado'}`,
@@ -108,7 +134,7 @@ function buildAnalysisPrompt({ classContext, userNotes = '' }) {
     'OBSERVAÇÕES ESPECÍFICAS:',
     notes,
     '',
-    'ESTRUTURA OBRIGATÓRIA DO RELATÓRIO: siga estritamente o DNA acima e inclua notas, evidências e próximos passos.'
+    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 12 pilares e a estrutura obrigatória definida no DNA.'
   ].join('\n');
 }
 
@@ -125,8 +151,9 @@ app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.
 async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl, signedUrlExpiresAt, videoValidation }) {
   const file = await uploadToGemini(videoPath, 'video/mp4');
   const active = await waitForGeminiActive(file.name);
-  const classContext = buildClassContext({ ...classContextInput, cameraId });
+  const classContext = buildClassContext({ ...classContextInput, cameraId }, classContextInput);
   const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
+  validatePromptHasFullDNA(finalPrompt);
   const rawResponse = await analyzeVideo(active.uri, finalPrompt, { ...classContext, cameraId, recordingId });
   const noClassDetected = detectNoClass(rawResponse);
   const status = noClassDetected ? 'completed_no_class_detected' : 'completed';
@@ -162,7 +189,7 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
     driveJsonUrl: null,
     metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
     video: { gcsFileName: gcsFileName || recordingId, signedUrl: signedUrl || null, signedUrlExpiresAt: signedUrlExpiresAt || null, validation: videoValidation || null },
-    prompt: { dnaVersion: '1.0', promptTemplateVersion: '1.0', userNotes: normalizeField(prompt), finalPromptPreview: finalPrompt.slice(0, 1500) },
+    prompt: { dnaVersion: '1.0', promptTemplateVersion: '2.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
     analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status }
   };
   if (pdfUrl) responsePayload.drivePdfUrl = pdfUrl;
@@ -182,7 +209,7 @@ app.post('/analyze-video-url', async (req, res) => {
     }
     const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl: videoUrl, videoValidation });
     return res.json(analysis);
-  } catch (error) { return res.status(500).json({ error: error.message, failedStage: 'validating_video_backend', fileSize: videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : 0, videoValidation: null }); }
+  } catch (error) { return res.status(error.statusCode || 500).json({ error: error.message, failedStage: 'validating_video_backend', missingPillars: error.missingPillars || [], fileSize: videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : 0, videoValidation: null }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
 
@@ -198,7 +225,7 @@ app.post('/analyze-drive', async (req, res) => {
     if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
     const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName: finalFileId, videoValidation });
     return res.json(analysis);
-  } catch (error) { return res.status(500).json({ error: error.message }); }
+  } catch (error) { return res.status(error.statusCode || 500).json({ error: error.message, missingPillars: error.missingPillars || [] }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
 
