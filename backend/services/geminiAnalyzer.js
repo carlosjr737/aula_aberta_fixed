@@ -37,7 +37,34 @@ async function waitForGeminiActive(fileName) {
 }
 
 async function analyzeVideo(fileUri, prompt, metadata) {
+  const textPart = `${prompt}\n\nMetadata:${JSON.stringify(metadata)}`;
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ file_data: { mime_type: 'video/mp4', file_uri: fileUri } }, { text: textPart }] }]
+    })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || 'Falha análise Gemini');
+  return data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n') || 'Sem resposta textual';
+}
+
+async function analyzeText(prompt) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || 'Falha análise textual Gemini');
+  return data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n') || 'Sem resposta textual';
+}
+
+async function countVideoTokens(fileUri, prompt, metadata) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:countTokens?key=${process.env.GEMINI_API_KEY}`;
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -46,8 +73,8 @@ async function analyzeVideo(fileUri, prompt, metadata) {
     })
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || 'Falha análise Gemini');
-  return data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n') || 'Sem resposta textual';
+  if (!response.ok) throw new Error(data?.error?.message || 'Falha countTokens Gemini');
+  return Number(data?.totalTokens || 0);
 }
 
-module.exports = { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL };
+module.exports = { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL };

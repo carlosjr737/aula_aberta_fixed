@@ -7,7 +7,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
-const { uploadToGemini, waitForGeminiActive, analyzeVideo, GEMINI_MODEL } = require('./services/geminiAnalyzer');
+const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL } = require('./services/geminiAnalyzer');
 const { DNA_PROFESSOR_DK_FULL_OPERATIONAL } = require('./prompts/dnaProfessorDKFullOperational');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
@@ -18,6 +18,7 @@ try { ffprobePath = require('ffprobe-static').path || 'ffprobe'; } catch (_error
 const app = express();
 const PORT = process.env.PORT || 3000;
 const execFileAsync = promisify(execFile);
+const TOKEN_SINGLE_ANALYSIS_LIMIT = 900000;
 const MIN_VALIDATION_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_FILE_SIZE_BYTES = 100 * 1024;
 const DEFAULT_PROMPT = 'Observar principalmente autonomia, refinamento e responsabilidade de elenco.';
@@ -144,17 +145,71 @@ function detectNoClass(rawResponse = '') {
   return signs.some((sign) => text.includes(sign));
 }
 
+async function segmentVideo(videoPath, segmentSeconds = 600) {
+  const segmentPrefix = path.join(os.tmpdir(), `dk_segment_${Date.now()}_${path.basename(videoPath, path.extname(videoPath))}`);
+  await execFileAsync('ffmpeg', ['-hide_banner', '-y', '-i', videoPath, '-c', 'copy', '-f', 'segment', '-segment_time', String(segmentSeconds), '-reset_timestamps', '1', `${segmentPrefix}_%03d.mp4`]);
+  const files = fs.readdirSync(os.tmpdir())
+    .filter((name) => name.startsWith(path.basename(segmentPrefix)) && name.endsWith('.mp4'))
+    .map((name) => path.join(os.tmpdir(), name))
+    .sort();
+  if (!files.length) throw new Error('Falha ao segmentar vídeo em blocos temporais.');
+  return files;
+}
+
 app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), GCS_BUCKET_NAME: Boolean(process.env.GCS_BUCKET_NAME), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
 async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl, signedUrlExpiresAt, videoValidation }) {
-  const file = await uploadToGemini(videoPath, 'video/mp4');
-  const active = await waitForGeminiActive(file.name);
   const classContext = buildClassContext({ ...classContextInput, cameraId }, classContextInput);
   const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
   validatePromptHasFullDNA(finalPrompt);
-  const rawResponse = await analyzeVideo(active.uri, finalPrompt, { ...classContext, cameraId, recordingId });
+  const metadata = { ...classContext, cameraId, recordingId };
+  const file = await uploadToGemini(videoPath, 'video/mp4');
+  const active = await waitForGeminiActive(file.name);
+  const tokenCount = await countVideoTokens(active.uri, finalPrompt, metadata);
+  console.log(`[analysis:${recordingId}] tokenCount estimado=${tokenCount}`);
+  let rawResponse = '';
+  let strategy = 'single';
+  let segmentCount = 0;
+
+  if (tokenCount <= TOKEN_SINGLE_ANALYSIS_LIMIT) {
+    console.log(`[analysis:${recordingId}] estratégia=inteiro`);
+    rawResponse = await analyzeVideo(active.uri, finalPrompt, metadata);
+  } else {
+    strategy = 'segmented';
+    console.log(`[analysis:${recordingId}] estratégia=segmentado`);
+    const segments = await segmentVideo(videoPath, 600);
+    segmentCount = segments.length;
+    console.log(`[analysis:${recordingId}] segmentos=${segmentCount}`);
+    const partialAnalyses = [];
+    for (let index = 0; index < segments.length; index += 1) {
+      const segmentPath = segments[index];
+      console.log(`[analysis:${recordingId}] início análise parcial segmento ${index + 1}/${segmentCount}`);
+      const segmentUpload = await uploadToGemini(segmentPath, 'video/mp4');
+      const segmentActive = await waitForGeminiActive(segmentUpload.name);
+      const partialPrompt = `${finalPrompt}
+
+ANÁLISE PARCIAL DE BLOCO TEMPORAL:
+- Este é o bloco ${index + 1} de ${segmentCount}.
+- Responda apenas com análise parcial deste bloco.
+- Inclua horários aproximados dentro deste bloco (ex.: minuto 02:30), evidências observáveis e notas parciais por pilares quando aplicável.
+- Não conclua o relatório final ainda.`;
+      const partialText = await analyzeVideo(segmentActive.uri, partialPrompt, { ...metadata, segmentIndex: index + 1, segmentCount });
+      partialAnalyses.push(`BLOCO ${index + 1}/${segmentCount}:\n${partialText}`);
+      console.log(`[analysis:${recordingId}] fim análise parcial segmento ${index + 1}/${segmentCount}`);
+      if (fs.existsSync(segmentPath)) fs.unlinkSync(segmentPath);
+    }
+    console.log(`[analysis:${recordingId}] início consolidação final`);
+    const consolidationPrompt = `${finalPrompt}
+
+CONSOLIDE AS ANÁLISES PARCIAIS ABAIXO EM UM RELATÓRIO FINAL COMPLETO COM OS 12 PILARES DO DNA PROFESSOR DK.
+Mantenha evidências observáveis, progressão temporal, síntese executiva e plano de evolução.
+
+${partialAnalyses.join('\n\n')}`;
+    rawResponse = await analyzeText(consolidationPrompt);
+    console.log(`[analysis:${recordingId}] fim consolidação final`);
+  }
   const noClassDetected = detectNoClass(rawResponse);
   const status = noClassDetected ? 'completed_no_class_detected' : 'completed';
 
@@ -190,7 +245,7 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
     metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
     video: { gcsFileName: gcsFileName || recordingId, signedUrl: signedUrl || null, signedUrlExpiresAt: signedUrlExpiresAt || null, validation: videoValidation || null },
     prompt: { dnaVersion: '1.0', promptTemplateVersion: '2.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
-    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status }
+    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status, tokenCount, strategy, segmentCount }
   };
   if (pdfUrl) responsePayload.drivePdfUrl = pdfUrl;
   return responsePayload;

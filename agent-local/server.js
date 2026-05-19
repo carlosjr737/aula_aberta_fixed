@@ -79,7 +79,7 @@ const SCHEDULE_PATH = path.join(__dirname, '..', 'config', 'class-schedule.json'
 const MIN_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_MIN_BYTES = 100 * 1024;
 const CLEANUP_LOCAL_FILES = false;
-const TARGET_VIDEO_FPS = 10;
+const TARGET_VIDEO_FPS = 3;
 
 const MAX_FFMPEG_LOG_CHARS = 20000;
 
@@ -232,11 +232,6 @@ function zonedDateTimeToUtc(dateText, start, timeZone) {
   return new Date(guess.getTime() - offset);
 }
 
-function buildGeminiPrompt(classItem, _dnaText, standardPrompt) {
-  const observacoes = classItem.observacoes || classItem.prompt || '';
-  return `[CONTEXTO DA AULA]\nProfessor: ${classItem.professor || ''}\nModalidade: ${classItem.modalidade || ''}\nTurma: ${classItem.turma || ''}\nFaixa etária: ${classItem.faixaEtaria || ''}\nNível: ${classItem.nivel || ''}\nTipo de aula: ${classItem.tipoAula || ''}\nSala: ${classItem.sala || ''}\nCâmera: ${classItem.cameraId}\nData: ${classItem.date || ''}\nHorário de início: ${classItem.start || classItem.horario || ''}\nDuração: ${classItem.durationMinutes || ''} minutos\n\n[OBSERVAÇÕES ESPECÍFICAS DA ANÁLISE]\n${observacoes}\n\n[ESTRUTURA OBRIGATÓRIA DO RELATÓRIO]\n${standardPrompt}`;
-}
-
 async function processRecordingInBackground(classItem) {
   const status = dailyScheduleState.classes.get(classItem.id);
   if (!status) return;
@@ -334,8 +329,6 @@ app.post('/start-recording', (req, res) => {
     if (!rtspUrl) return res.status(400).json({ error: 'RTSP não configurado para esta câmera', cameraId, availableCameras: Object.keys(CAMERAS) });
     if (!RAILWAY_API_URL) return res.status(500).json({ error: 'RAILWAY_API_URL não configurada.' });
 
-    const dnaText = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'dna-professor-dk.md'), 'utf-8');
-    const standardPrompt = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'prompt-avaliacao-aula.md'), 'utf-8');
 
     const durationSeconds = Math.floor(Math.max(1, Number(req.body.durationMinutes || 60)) * 60);
     const recordingId = crypto.randomUUID();
@@ -351,7 +344,7 @@ app.post('/start-recording', (req, res) => {
       '-t', String(durationSeconds),
       '-map', '0:v:0',
       '-map', '0:a:0?',
-      '-vf', 'fps=10,scale=-2:720',
+      '-vf', `fps=${TARGET_VIDEO_FPS},scale=-2:720`,
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '23',
@@ -369,7 +362,7 @@ app.post('/start-recording', (req, res) => {
     const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 
     const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: req.body.professor || '', turma: req.body.turma || '', nivel: req.body.nivel || '', sala: req.body.sala || '', horario: req.body.horario || '', prompt: '', cameraId, observacoes: req.body.observacoes || req.body.prompt || '', startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
-    rec.prompt = buildGeminiPrompt({ ...req.body, cameraId, durationMinutes: Number(req.body.durationMinutes || 60), date: new Date().toISOString().slice(0,10), start: req.body.horario || '' }, dnaText, standardPrompt);
+    rec.prompt = req.body.observacoes || req.body.prompt || '';
     recordings.set(recordingId, rec);
 
     ffmpeg.stderr.on('data', (chunk) => {
@@ -442,8 +435,6 @@ app.post('/start-daily-schedule', async (_req, res) => {
       }
     }
 
-    const dnaText = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'dna-professor-dk.md'), 'utf-8');
-    const standardPrompt = fs.readFileSync(path.join(__dirname, '..', 'prompts', 'prompt-avaliacao-aula.md'), 'utf-8');
     dailyScheduleState.started = true;
     dailyScheduleState.scheduleDate = schedule.date;
     dailyScheduleState.timezone = timezone;
@@ -477,9 +468,9 @@ app.post('/start-daily-schedule', async (_req, res) => {
           status.recordingId = recordingId;
           const outputPath = status.videoPath;
           const durationSeconds = Math.floor(durationMinutes * 60);
-          const ffmpegArgs = ['-hide_banner', '-y', '-nostdin', '-rtsp_transport', 'tcp', '-fflags', '+genpts+discardcorrupt', '-use_wallclock_as_timestamps', '1', '-i', rtspUrl, '-t', String(durationSeconds), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'fps=10,scale=-2:720', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '64k', '-ar', '16000', '-ac', '1', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', outputPath];
+          const ffmpegArgs = ['-hide_banner', '-y', '-nostdin', '-rtsp_transport', 'tcp', '-fflags', '+genpts+discardcorrupt', '-use_wallclock_as_timestamps', '1', '-i', rtspUrl, '-t', String(durationSeconds), '-map', '0:v:0', '-map', '0:a:0?', '-vf', `fps=${TARGET_VIDEO_FPS},scale=-2:720`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '64k', '-ar', '16000', '-ac', '1', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', outputPath];
           const ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
-          const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: classItem.professor || '', turma: classItem.turma || '', nivel: classItem.nivel || '', sala: classItem.sala || classItem.cameraId || '', horario: classItem.start || '', prompt: buildGeminiPrompt({ ...classItem, date: schedule.date, durationMinutes }, dnaText, standardPrompt), cameraId: classItem.cameraId, observacoes: classItem.observacoes || '', startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
+          const rec = { id: recordingId, recordingId, status: 'recording', failedStage: null, outputPath, fileSize: null, videoValidation: null, processRef: ffmpeg, ffmpegStderr: '', ffmpegLastLog: '', professor: classItem.professor || '', turma: classItem.turma || '', nivel: classItem.nivel || '', sala: classItem.sala || classItem.cameraId || '', horario: classItem.start || '', prompt: classItem.observacoes || classItem.prompt || '', cameraId: classItem.cameraId, observacoes: classItem.observacoes || '', startedAt: new Date().toISOString(), finishedAt: null, gcsBucket: null, gcsFileName: null, videoUrl: null, uploadedAt: null, railwayResponse: null, error: null };
     recordings.set(recordingId, rec);
           ffmpeg.stderr.on('data', (chunk) => { rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, chunk, MAX_FFMPEG_LOG_CHARS); });
           ffmpeg.on('close', async (code) => {
