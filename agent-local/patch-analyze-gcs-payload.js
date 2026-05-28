@@ -67,9 +67,16 @@ if (typeof originalFetch === 'function') {
       throw new Error(`Payload invalido para /analyze-gcs: bucketName/fileName ausentes. uploadResult=${JSON.stringify(payload)}`);
     }
 
+    const bodyJson = JSON.stringify(normalizedPayload);
+    console.log(`[processing:${recordingId}] analyze-gcs bodyJson`, bodyJson);
+
     return originalFetch(input, {
       ...init,
-      body: JSON.stringify(normalizedPayload)
+      headers: {
+        ...(init.headers || {}),
+        'Content-Type': 'application/json'
+      },
+      body: bodyJson
     });
   };
 }
