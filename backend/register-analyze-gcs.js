@@ -60,16 +60,58 @@ function registerRoutes(app) {
     }
   }));
 
-  app.post('/analyze-gcs', async (req, res) => {
+  app.post('/analyze-gcs', originalExpress.json({ limit: '50mb' }), async (req, res) => {
     const body = req.body || {};
-    const bucketName = normalizeField(body.bucketName, body.bucket, body.gcsBucket, process.env.GCS_BUCKET, process.env.GCS_BUCKET_NAME);
-    const fileName = normalizeField(body.fileName, body.gcsPath, body.gcsFileName);
+    const bodyKeys = Object.keys(body);
+
+    console.log('[analyze-gcs] content-type:', req.headers['content-type']);
+    console.log('[analyze-gcs] body keys:', bodyKeys);
+    console.log('[analyze-gcs] bucketName:', body.bucketName);
+    console.log('[analyze-gcs] fileName:', body.fileName);
+
+    if (!body || bodyKeys.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        failedStage: 'request_body_parse',
+        message: 'Body JSON vazio ou nao parseado. Verifique express.json() e Content-Type.',
+        receivedContentType: req.headers['content-type'],
+        bodyKeys
+      });
+    }
+
+    if (body.test) {
+      return res.json({
+        ok: true,
+        route: '/analyze-gcs',
+        bodyKeys,
+        receivedBucketName: body.bucketName || null,
+        receivedFileName: body.fileName || null
+      });
+    }
+
+    const bucketName = normalizeField(
+      body.bucketName,
+      body.bucket,
+      body.gcsBucket,
+      process.env.GCS_BUCKET,
+      process.env.GCS_BUCKET_NAME
+    );
+    const fileName = normalizeField(
+      body.fileName,
+      body.gcsPath,
+      body.objectName,
+      body.destination,
+      body.storagePath,
+      body.gcsFileName
+    );
 
     if (!bucketName || !fileName) {
       return res.status(400).json({
         ok: false,
         failedStage: 'request_validation',
-        message: 'bucketName/fileName sao obrigatorios'
+        message: 'bucketName/fileName sao obrigatorios',
+        receivedContentType: req.headers['content-type'],
+        bodyKeys
       });
     }
 
