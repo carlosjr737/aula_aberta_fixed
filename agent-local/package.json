@@ -4,8 +4,8 @@
   "description": "Agente local para gravar RTSP e enviar para análise no Railway",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
+    "start": "node -r ./patch-analyze-gcs-payload.js server.js",
+    "dev": "node -r ./patch-analyze-gcs-payload.js server.js",
     "test:health": "curl http://localhost:4000/health"
   },
   "engines": {
