@@ -11,7 +11,6 @@ const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVid
 const { DNA_PROFESSOR_DK_FULL_OPERATIONAL } = require('./prompts/dnaProfessorDKFullOperational');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
-const { uploadFileToGCS, generateSignedReadUrl } = require('./services/gcsStorage');
 let ffprobePath = 'ffprobe';
 try { ffprobePath = require('ffprobe-static').path || 'ffprobe'; } catch (_error) { ffprobePath = 'ffprobe'; }
 
@@ -22,6 +21,7 @@ const TOKEN_SINGLE_ANALYSIS_LIMIT = 900000;
 const MIN_VALIDATION_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_FILE_SIZE_BYTES = 100 * 1024;
 const DEFAULT_PROMPT = 'Observar principalmente autonomia, refinamento e responsabilidade de elenco.';
+const ANALYSIS_ROUTES = ['/analyze-drive', '/analyze-gcs'];
 
 const REQUIRED_PILLARS = [
   'Clareza de Objetivo e Direção Pedagógica',
@@ -39,29 +39,73 @@ const REQUIRED_PILLARS = [
 ];
 
 app.use(cors({ origin: true }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+
+function parseServiceAccountJson() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON nÃ£o configurado.');
+  const credentials = JSON.parse(String(raw).trim());
+  if (credentials.private_key) credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+  return credentials;
+}
+
+function logStage(jobId, stage, data = {}) {
+  console.log(`[analysis:${jobId}] ${stage} ${JSON.stringify(data)}`);
+}
+
+function logStageError(jobId, stage, error, data = {}) {
+  console.error(`[analysis:${jobId}] ${stage} ${JSON.stringify({
+    stage,
+    message: error?.message || String(error || ''),
+    stack: error?.stack || null,
+    endpoint: data.endpoint || null,
+    httpStatus: error?.status || error?.statusCode || data.httpStatus || null,
+    responseBody: error?.responseText || data.responseBody || null,
+    localPath: data.localPath || null,
+    gcsBucket: data.gcsBucket || null,
+    gcsFileName: data.gcsFileName || null
+  })}`);
+}
+
+function buildFailureResponse(error, failedStage, details = {}) {
+  return {
+    ok: false,
+    failedStage,
+    message: error?.message || String(error || ''),
+    details: {
+      ...details,
+      stack: error?.stack || null,
+      httpStatus: error?.status || error?.statusCode || null,
+      responseText: error?.responseText || null
+    }
+  };
+}
 
 function extractDriveFileId(input) { if (!input) return null; if (/^[a-zA-Z0-9_-]{20,}$/.test(input)) return input; const m = String(input).match(/\/d\/([a-zA-Z0-9_-]+)/); return m?.[1] || null; }
-function getDriveClientRO() { const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive.readonly'] }); return google.drive({ version: 'v3', auth }); }
+function getDriveClientRO() { const credentials = parseServiceAccountJson(); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive.readonly'] }); return google.drive({ version: 'v3', auth }); }
+function getGcsClientRO() { const credentials = parseServiceAccountJson(); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/devstorage.read_only'] }); return google.storage({ version: 'v1', auth }); }
 async function downloadFromDrive(fileId, destPath) { const drive = getDriveClientRO(); const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
+async function downloadFromGCS(bucketName, fileName, destPath) { const storage = getGcsClientRO(); const res = await storage.objects.get({ bucket: bucketName, object: fileName, alt: 'media' }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
 async function downloadFromUrl(url, destPath) { const response = await fetch(url); if (!response.ok) throw new Error(`Falha ao baixar vídeo URL: ${response.status}`); await pipeline(response.body, fs.createWriteStream(destPath)); }
-async function validateVideoFile(filePath) {
+async function validateVideoFileLegacy(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return { valid: false, fileSize: 0, error: 'Arquivo não encontrado.' };
   const fileSize = fs.statSync(filePath).size;
   if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo inválido (${fileSize} bytes).` };
 
   try {
-    const { stdout } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    const { stdout, stderr } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    if (stderr && /moov atom not found/i.test(stderr)) return { valid: false, fileSize, error: 'Arquivo invalido: moov atom not found.', ffprobeStderr: stderr };
     const probe = JSON.parse(stdout || '{}');
     const streams = Array.isArray(probe.streams) ? probe.streams : [];
     const videoStream = streams.find((stream) => stream.codec_type === 'video');
     if (!videoStream) return { valid: false, fileSize, error: 'Arquivo inválido: stream de vídeo não encontrada.' };
     const audioStream = streams.find((stream) => stream.codec_type === 'audio');
-    const durationRaw = videoStream.duration || probe?.format?.duration || 0;
+    const durationRaw = probe?.format?.duration || videoStream.duration || 0;
     const duration = Number(durationRaw) || 0;
-    return { valid: true, fileSize, duration, codec: videoStream.codec_name || null, width: Number(videoStream.width) || null, height: Number(videoStream.height) || null, hasAudio: Boolean(audioStream) };
-  } catch (_error) {
-    if (fileSize >= FFPROBE_FALLBACK_FILE_SIZE_BYTES) {
+    if (!duration || duration <= 0) return { valid: false, fileSize, error: 'Arquivo invalido: duracao ausente ou zero.', ffprobeData: probe };
+    return { valid: true, fileSize, duration, formatDuration: Number(probe?.format?.duration || 0) || null, codec: videoStream.codec_name || null, width: Number(videoStream.width) || null, height: Number(videoStream.height) || null, hasAudio: Boolean(audioStream) };
+  } catch (error) {
+    if (false && fileSize >= FFPROBE_FALLBACK_FILE_SIZE_BYTES) {
       return {
         valid: true,
         fileSize,
@@ -76,7 +120,40 @@ async function validateVideoFile(filePath) {
     return { valid: false, fileSize, error: 'Falha ao validar vídeo com ffprobe.' };
   }
 }
+async function validateVideoFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return { valid: false, fileSize: 0, error: 'Arquivo nao encontrado.' };
+  const fileSize = fs.statSync(filePath).size;
+  if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo invalido (${fileSize} bytes).` };
 
+  try {
+    const { stdout, stderr } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    if (stderr && /moov atom not found/i.test(stderr)) return { valid: false, fileSize, error: 'Arquivo invalido: moov atom not found.', ffprobeStderr: stderr };
+    const probe = JSON.parse(stdout || '{}');
+    const streams = Array.isArray(probe.streams) ? probe.streams : [];
+    const videoStream = streams.find((stream) => stream.codec_type === 'video');
+    if (!videoStream) return { valid: false, fileSize, error: 'Arquivo invalido: stream de video nao encontrada.', ffprobeData: probe };
+    const audioStream = streams.find((stream) => stream.codec_type === 'audio');
+    const duration = Number(probe?.format?.duration || videoStream?.duration || 0) || 0;
+    if (!duration || duration <= 0) return { valid: false, fileSize, error: 'Arquivo invalido: duracao ausente ou zero.', ffprobeData: probe };
+    return {
+      valid: true,
+      fileSize,
+      duration,
+      formatDuration: Number(probe?.format?.duration || 0) || null,
+      videoDuration: Number(videoStream?.duration || 0) || null,
+      codec: videoStream.codec_name || null,
+      width: Number(videoStream.width) || null,
+      height: Number(videoStream.height) || null,
+      hasAudio: Boolean(audioStream)
+    };
+  } catch (error) {
+    const details = error?.stderr || error?.stdout || error?.message || '';
+    const message = /moov atom not found/i.test(details)
+      ? 'Arquivo invalido: moov atom not found.'
+      : `Falha ao validar video com ffprobe: ${details}`;
+    return { valid: false, fileSize, error: message, ffprobeError: error?.message || null, ffprobeStderr: error?.stderr || null, ffprobeStdout: error?.stdout || null };
+  }
+}
 
 function normalizeField(...values) {
   for (const value of values) {
@@ -156,17 +233,31 @@ async function segmentVideo(videoPath, segmentSeconds = 600) {
   return files;
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true, model: GEMINI_MODEL }));
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  service: 'aula-aberta-backend',
+  model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+  routes: ['/health', '/analyze-gcs', '/analyze-drive'],
+  env: {
+    GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY),
+    GOOGLE_APPLICATION_CREDENTIALS: Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS),
+    GCS_BUCKET: Boolean(process.env.GCS_BUCKET)
+  }
+}));
+app.get('/routes', (_req, res) => res.json({ ok: true, routes: ['/health', '/routes', '/default-prompt', '/debug-env', ...ANALYSIS_ROUTES] }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
-app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), GCS_BUCKET_NAME: Boolean(process.env.GCS_BUCKET_NAME), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
+app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
-async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl, signedUrlExpiresAt, videoValidation }) {
+async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName, sourceUrl, sourceUrlExpiresAt, videoValidation }) {
+  logStage(recordingId, 'analysis_started', { localPath: videoPath, sourceFileName });
   const classContext = buildClassContext({ ...classContextInput, cameraId }, classContextInput);
   const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
   validatePromptHasFullDNA(finalPrompt);
   const metadata = { ...classContext, cameraId, recordingId };
+  logStage(recordingId, 'gemini_upload_started', { localPath: videoPath });
   const file = await uploadToGemini(videoPath, 'video/mp4');
   const active = await waitForGeminiActive(file.name);
+  logStage(recordingId, 'gemini_upload_success', { geminiFile: file.name });
   const tokenCount = await countVideoTokens(active.uri, finalPrompt, metadata);
   console.log(`[analysis:${recordingId}] tokenCount estimado=${tokenCount}`);
   let rawResponse = '';
@@ -215,57 +306,147 @@ ${partialAnalyses.join('\n\n')}`;
 
   const reportPayload = { recordingId, professor: classContext.professor, turma: classContext.turma, nivel: classContext.nivel, sala: classContext.sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
 
-  const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'none').toLowerCase();
+  const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'local').toLowerCase();
   let pdfUrl = null;
   let pdfPath = null;
-  if (pdfUploadProvider === 'gcs') {
-    pdfPath = await generateLessonPdf(reportPayload);
-    const analysisId = recordingId || `analysis_${Date.now()}`;
-    const date = new Date().toISOString().slice(0, 10);
-    const fileName = `reports/${date}/${analysisId}.pdf`;
-    await uploadFileToGCS(pdfPath, fileName, 'application/pdf');
-    pdfUrl = await generateSignedReadUrl(fileName, 120);
-  } else if (pdfUploadProvider === 'drive') {
-    pdfPath = await generateLessonPdf(reportPayload);
-    const driveData = await uploadPdf(pdfPath, { professor });
+  logStage(recordingId, 'report_generation_started', { provider: pdfUploadProvider });
+  pdfPath = await generateLessonPdf(reportPayload);
+  logStage(recordingId, 'report_generated', { pdfPath });
+  if (pdfUploadProvider === 'drive') {
+    const driveData = await uploadPdf(pdfPath, { professor: classContext.professor });
     pdfUrl = driveData?.webViewLink || null;
+    logStage(recordingId, 'report_upload_success', { provider: 'drive', reportUrl: pdfUrl });
   }
-  if (pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
+  if (pdfUploadProvider === 'drive' && pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
 
   const responsePayload = {
+    ok: true,
     status,
     recordingId,
     classContext,
-    videoGcsFileName: gcsFileName || recordingId,
+    videoFileName: sourceFileName || recordingId,
     reportText: rawResponse,
     localJsonPath: null,
-    localPdfPath: null,
+    localPdfPath: pdfUploadProvider === 'drive' ? null : pdfPath,
+    reportUrl: pdfUrl || (pdfUploadProvider === 'drive' ? null : pdfPath),
     drivePdfUrl: null,
     driveJsonUrl: null,
     metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
-    video: { gcsFileName: gcsFileName || recordingId, signedUrl: signedUrl || null, signedUrlExpiresAt: signedUrlExpiresAt || null, validation: videoValidation || null },
+    video: { fileName: sourceFileName || recordingId, sourceUrl: sourceUrl || null, sourceUrlExpiresAt: sourceUrlExpiresAt || null, validation: videoValidation || null },
     prompt: { dnaVersion: '1.0', promptTemplateVersion: '2.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
     analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status, tokenCount, strategy, segmentCount }
   };
   if (pdfUrl) responsePayload.drivePdfUrl = pdfUrl;
+  logStage(recordingId, 'analysis_completed', { status, reportUrl: responsePayload.reportUrl || responsePayload.drivePdfUrl || null });
   return responsePayload;
 }
 
-app.post('/analyze-video-url', async (req, res) => {
+app.post('/disabled-url-analysis', async (req, res) => {
   let videoPath = null;
   try {
-    const { videoUrl, gcsBucket = '', gcsFileName = '', professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
+    const { videoUrl, fileName = '', professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl é obrigatório.' });
-    videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}.mp4`);
+    videoPath = path.join(os.tmpdir(), `url_video_${Date.now()}.mp4`);
     await downloadFromUrl(videoUrl, videoPath);
     const videoValidation = await validateVideoFile(videoPath);
     if (!videoValidation.valid) {
       return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
     }
-    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: gcsFileName || `url_${Date.now()}`, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName, signedUrl: videoUrl, videoValidation });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: fileName || `url_${Date.now()}`, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName: fileName, sourceUrl: videoUrl, videoValidation });
     return res.json(analysis);
   } catch (error) { return res.status(error.statusCode || 500).json({ error: error.message, failedStage: 'validating_video_backend', missingPillars: error.missingPillars || [], fileSize: videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : 0, videoValidation: null }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
+});
+
+app.post('/analyze-gcs', async (req, res) => {
+  let videoPath = null;
+  const endpoint = '/analyze-gcs';
+  const body = req.body || {};
+  const recordingId = normalizeField(body.recordingId, body.gcsFileName, body.fileName, `gcs_${Date.now()}`);
+  const bucketName = normalizeField(body.bucketName, body.bucket, body.gcsBucket);
+  const fileName = normalizeField(body.fileName, body.gcsPath, body.objectName, body.destination, body.gcsFileName, body.storagePath);
+  const gcsBucket = bucketName;
+  const gcsFileName = fileName;
+
+  console.log('[analyze-gcs] content-type:', req.headers['content-type']);
+  console.log('[analyze-gcs] body keys:', Object.keys(body || {}));
+  console.log('[analyze-gcs] bucketName:', bucketName || null);
+  console.log('[analyze-gcs] fileName:', fileName || null);
+
+  if (body && body.test) {
+    return res.json({
+      ok: true,
+      route: '/analyze-gcs',
+      bodyKeys: Object.keys(body || {}),
+      receivedBucketName: bucketName || null,
+      receivedFileName: fileName || null,
+      message: 'Rota analyze-gcs registrada e recebendo JSON.'
+    });
+  }
+
+  try {
+    logStage(recordingId, 'analysis_request_started', { endpoint, gcsBucket, gcsFileName });
+    if (!gcsBucket || !gcsFileName) {
+      const error = new Error('bucketName/fileName sao obrigatorios.');
+      logStageError(recordingId, 'analysis_request_failed', error, { endpoint, gcsBucket, gcsFileName });
+      return res.status(400).json({
+        ok: false,
+        failedStage: 'request_validation',
+        message: 'bucketName/fileName sao obrigatorios',
+        bodyKeys: Object.keys(body || {}),
+        receivedContentType: req.headers['content-type']
+      });
+    }
+
+    videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}_${path.basename(gcsFileName) || 'video.mp4'}`);
+    logStage(recordingId, 'download_started', { endpoint, gcsBucket, gcsFileName, localPath: videoPath });
+    await downloadFromGCS(gcsBucket, gcsFileName, videoPath);
+    logStage(recordingId, 'download_success', { localPath: videoPath, fileSize: fs.statSync(videoPath).size });
+
+    logStage(recordingId, 'video_validation_started', { localPath: videoPath, gcsBucket, gcsFileName });
+    const videoValidation = await validateVideoFile(videoPath);
+    if (!videoValidation.valid) {
+      const error = new Error(videoValidation.error || 'Video invalido.');
+      logStageError(recordingId, 'video_validation_failed', error, { endpoint, localPath: videoPath, gcsBucket, gcsFileName });
+      return res.status(400).json(buildFailureResponse(error, 'video_validation', { endpoint, localPath: videoPath, gcsBucket, gcsFileName, videoValidation }));
+    }
+    logStage(recordingId, 'video_validation_success', { localPath: videoPath, videoValidation });
+
+    const analysis = await analyzeFromLocalVideo({
+      videoPath,
+      recordingId,
+      classContextInput: {
+        professor: body.professor,
+        modalidade: body.modalidade,
+        turma: body.turma,
+        faixaEtaria: body.faixaEtaria,
+        nivel: body.nivel,
+        sala: body.sala,
+        data: body.data,
+        horarioAgendado: body.horario,
+        durationMinutes: body.durationMinutes || body.duracao,
+        observacoes: body.observacoes
+      },
+      prompt: body.prompt || body.observacoes || DEFAULT_PROMPT,
+      cameraId: body.cameraId,
+      recordingStartedAt: body.recordingStartedAt,
+      recordingEndedAt: body.recordingEndedAt,
+      sourceFileName: gcsFileName,
+      sourceUrl: body.videoUrl || `gs://${gcsBucket}/${gcsFileName}`,
+      videoValidation
+    });
+
+    return res.json({
+      ...analysis,
+      videoFile: { bucket: gcsBucket, fileName: gcsFileName, localPath: videoPath, validation: videoValidation },
+      metadata: { ...(analysis.metadata || {}), gcsBucket, gcsFileName }
+    });
+  } catch (error) {
+    logStageError(recordingId, 'analysis_failed', error, { endpoint, localPath: videoPath, gcsBucket, gcsFileName });
+    return res.status(error.statusCode || 500).json(buildFailureResponse(error, 'analysis', { endpoint, localPath: videoPath, gcsBucket, gcsFileName, missingPillars: error.missingPillars || [] }));
+  } finally {
+    if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  }
 });
 
 app.post('/analyze-drive', async (req, res) => {
@@ -278,10 +459,16 @@ app.post('/analyze-drive', async (req, res) => {
     await downloadFromDrive(finalFileId, videoPath);
     const videoValidation = await validateVideoFile(videoPath);
     if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
-    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, gcsFileName: finalFileId, videoValidation });
+    const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName: finalFileId, videoValidation });
     return res.json(analysis);
   } catch (error) { return res.status(error.statusCode || 500).json({ error: error.message, missingPillars: error.missingPillars || [] }); }
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
 
-app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log('Backend iniciado');
+  console.log(`Backend rodando na porta ${PORT}`);
+  console.log('GET /health registered');
+  console.log('POST /analyze-gcs registered');
+  console.log('POST /analyze-drive registered');
+});
