@@ -51,6 +51,8 @@ const MAX_RECORDING_DELAY_MINUTES = Number.isFinite(configuredMaxRecordingDelayM
   : 10;
 const MAX_TIMEOUT_MS = 2147483647;
 const LATE_TOLERANCE_MS = 5 * 60 * 1000;
+const RECORDING_GRACE_SECONDS = Number(process.env.RECORDING_GRACE_SECONDS || 30);
+const FORCE_KILL_GRACE_SECONDS = Number(process.env.FORCE_KILL_GRACE_SECONDS || 15);
 
 const MAX_FFMPEG_LOG_CHARS = 20000;
 
@@ -64,6 +66,31 @@ function appendBoundedLog(currentLog, chunk, maxChars = MAX_FFMPEG_LOG_CHARS) {
 function getLogTail(log, maxChars = MAX_FFMPEG_LOG_CHARS) {
   const safeLog = String(log || '');
   return safeLog.length > maxChars ? safeLog.slice(-maxChars) : safeLog;
+}
+
+function forceKillProcessTree(pid) {
+  return new Promise((resolve) => {
+    if (!pid) return resolve(false);
+
+    if (process.platform === 'win32') {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], (error) => {
+        if (error) {
+          console.error(`[ffmpeg] taskkill falhou pid=${pid}: ${error.message}`);
+          return resolve(false);
+        }
+        return resolve(true);
+      });
+      return;
+    }
+
+    try {
+      process.kill(pid, 'SIGKILL');
+      return resolve(true);
+    } catch (error) {
+      console.error(`[ffmpeg] SIGKILL falhou pid=${pid}: ${error.message}`);
+      return resolve(false);
+    }
+  });
 }
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
@@ -770,6 +797,9 @@ function startRecordingJob(options) {
   console.log(`[recording:${recordingId}] recording_started camera=${cameraId} duration=${durationSeconds}s source=${source}`);
   console.log(`[recording:${recordingId}] FFmpeg command: ${ffmpegCommand}`);
   const ffmpeg = spawn(FFMPEG_PATH, ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+  let closeHandled = false;
+  let watchdogTimer = null;
+  let forceKillTimer = null;
 
   const rec = {
     id: recordingId,
@@ -817,13 +847,26 @@ function startRecordingJob(options) {
     rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, chunk, MAX_FFMPEG_LOG_CHARS);
   });
 
-  ffmpeg.on('close', (code) => {
+  function handleFfmpegClosed(code, reason = 'close') {
+    if (closeHandled) return;
+    closeHandled = true;
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
+
     rec.finishedAt = new Date().toISOString();
     rec.ffmpegLastLog = getLogTail(rec.ffmpegStderr);
+    console.log(`[recording:${recordingId}] ffmpeg_closed reason=${reason} code=${code}`);
     console.log(`[recording:${recordingId}] FFmpeg finalizou com cÃ³digo ${code}`);
     console.log(`[recording:${recordingId}] recording_finished code=${code}`);
     if (rec.scheduleId) console.log(`[schedule:${rec.scheduleId}] Fim da gravaÃ§Ã£o cÃ³digo=${code}`);
     if (activeRecordings.get(cameraId) === recordingId) activeRecordings.delete(cameraId);
+
+    if (reason === 'forced_timeout') {
+      const details = setRecordingError(rec, 'recording_timeout', new Error('FFmpeg nÃ£o emitiu close apÃ³s force kill.'));
+      if (onStatus) onStatus(rec, 'failed', details);
+      startNextRecordingForCamera(cameraId);
+      return;
+    }
     if (code !== 0 && rec.status !== 'stopping') {
       const details = setRecordingError(rec, 'recording', new Error(`FFmpeg encerrou com cÃ³digo ${code}`));
       if (onStatus) onStatus(rec, 'failed', details);
@@ -844,15 +887,59 @@ function startRecordingJob(options) {
     enqueueProcessingJob(recordingId);
     if (rec.scheduleId) console.log(`[schedule:${rec.scheduleId}] Enviado para fila de processamento`);
     startNextRecordingForCamera(cameraId);
+  }
+
+  ffmpeg.on('close', (code) => {
+    handleFfmpegClosed(code, 'close');
+  });
+
+  ffmpeg.on('exit', (code, signal) => {
+    console.log(`[recording:${recordingId}] FFmpeg exit code=${code} signal=${signal}`);
   });
 
   ffmpeg.on('error', (error) => {
+    if (closeHandled) return;
+    closeHandled = true;
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+    if (forceKillTimer) clearTimeout(forceKillTimer);
     rec.ffmpegLastLog = getLogTail(rec.ffmpegStderr);
     if (activeRecordings.get(cameraId) === recordingId) activeRecordings.delete(cameraId);
     const details = setRecordingError(rec, 'starting_ffmpeg', error);
     if (onStatus) onStatus(rec, 'failed', details);
     startNextRecordingForCamera(cameraId);
   });
+
+  const safeRecordingGraceSeconds = Number.isFinite(RECORDING_GRACE_SECONDS) && RECORDING_GRACE_SECONDS >= 0 ? RECORDING_GRACE_SECONDS : 30;
+  const safeForceKillGraceSeconds = Number.isFinite(FORCE_KILL_GRACE_SECONDS) && FORCE_KILL_GRACE_SECONDS >= 0 ? FORCE_KILL_GRACE_SECONDS : 15;
+  const recordingWatchdogMs = (durationSeconds + safeRecordingGraceSeconds) * 1000;
+  watchdogTimer = setTimeout(() => {
+    if (closeHandled) return;
+
+    console.error(`[recording:${recordingId}] watchdog_timeout duration=${durationSeconds}s grace=${safeRecordingGraceSeconds}s. Enviando SIGINT para FFmpeg.`);
+    rec.status = 'stopping';
+
+    try {
+      if (rec.processRef && !rec.processRef.killed) {
+        rec.processRef.kill('SIGINT');
+        console.error(`[recording:${recordingId}] sigint_sent pid=${ffmpeg.pid}`);
+      }
+    } catch (error) {
+      console.error(`[recording:${recordingId}] Erro ao enviar SIGINT: ${error.message}`);
+    }
+
+    forceKillTimer = setTimeout(async () => {
+      if (closeHandled) return;
+
+      console.error(`[recording:${recordingId}] force_kill_timeout. Matando FFmpeg pid=${ffmpeg.pid}`);
+      await forceKillProcessTree(ffmpeg.pid);
+
+      setTimeout(() => {
+        if (closeHandled) return;
+        handleFfmpegClosed(1, 'forced_timeout');
+      }, 3000);
+    }, safeForceKillGraceSeconds * 1000);
+  }, recordingWatchdogMs);
+  console.log(`[recording:${recordingId}] recording_watchdog_started timeoutMs=${recordingWatchdogMs}`);
 
   return rec;
 }
