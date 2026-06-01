@@ -53,7 +53,7 @@ const MAX_TIMEOUT_MS = 2147483647;
 const LATE_TOLERANCE_MS = 5 * 60 * 1000;
 const RECORDING_GRACE_SECONDS = Number(process.env.RECORDING_GRACE_SECONDS || 30);
 const FORCE_KILL_GRACE_SECONDS = Number(process.env.FORCE_KILL_GRACE_SECONDS || 15);
-const FILE_PROGRESS_INTERVAL_MS = 10000;
+const FILE_PROGRESS_INTERVAL_MS = Number(process.env.FILE_PROGRESS_INTERVAL_MS || 60000);
 const NO_OUTPUT_TIMEOUT_MS = Number(process.env.NO_OUTPUT_TIMEOUT_MS || 35000);
 
 const MAX_FFMPEG_LOG_CHARS = 20000;
@@ -369,7 +369,7 @@ async function finalizeRecording(recordingId) {
     try {
       setProcessingStatus(recordingId, { status: 'analyzing', failedStage: null, errorMessage: null, errorStack: null });
       if (!RAILWAY_API_URL) throw new Error('RAILWAY_API_URL nÃ£o configurada.');
-      console.log(`[processing:${recordingId}] analysis_request_started`);
+      console.log(`[processing:${recordingId}] ${payload.accepted ? 'Analise aceita em background' : 'Analise concluida'}`);
       console.log(`[processing:${recordingId}] Chamando Railway`);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(new Error('Railway excedeu timeout de 60 minutos.')), RAILWAY_TIMEOUT_MS);
@@ -448,19 +448,31 @@ async function finalizeRecording(recordingId) {
         railwayError.endpoint = analysisEndpoint;
         throw railwayError;
       }
+      if (payload && payload.accepted === true && payload.jobId) {
+        console.log(`[processing:${recordingId}] analysis_request_accepted jobId=${payload.jobId}`);
+        console.log(`[processing:${recordingId}] Acompanhe em ${payload.statusUrl || `/jobs/${payload.jobId}`}`);
+      }
       rec.report = payload;
       rec.localJsonPath = payload.localJsonPath || null;
       rec.localPdfPath = payload.localPdfPath || null;
       rec.reportUrl = payload.reportUrl || payload.pdfUrl || payload?.analysis?.pdfUrl || null;
+      rec.analysisJobId = payload.jobId || null;
+      rec.analysisStatusUrl = payload.statusUrl || null;
       rec.remoteJsonUrl = payload.jsonUrl || null;
-      console.log(`[processing:${recordingId}] AnÃ¡lise concluÃ­da`);
+      console.log(`[processing:${recordingId}] ${payload.accepted ? 'Analise aceita em background' : 'Analise concluida'}`);
     } catch (error) {
-      console.log(`[processing:${recordingId}] analysis_request_failed`);
+      console.log(`[processing:${recordingId}] ${payload.accepted ? 'Analise aceita em background' : 'Analise concluida'}`);
       logProcessingError(recordingId, currentStage, error);
       throw error;
     }
 
     currentStage = 'pdf';
+    if (payload?.accepted) {
+      rec.status = 'analysis_accepted';
+      setProcessingStatus(recordingId, { status: 'analyzing', failedStage: null, errorMessage: null, errorStack: null });
+      console.log(`[processing:${recordingId}] analysis_job_status jobId=${payload.jobId} status=queued stage=queued`);
+      return;
+    }
     try {
       console.log(`[processing:${recordingId}] Salvando PDF`);
       await saveReportArtifacts(rec);

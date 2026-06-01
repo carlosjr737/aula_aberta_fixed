@@ -3,6 +3,7 @@ const cors = require('cors');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
@@ -24,6 +25,7 @@ const MIN_VALIDATION_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_FILE_SIZE_BYTES = 100 * 1024;
 const DEFAULT_PROMPT = 'Observar principalmente autonomia, refinamento e responsabilidade de elenco.';
 const ANALYSIS_ROUTES = ['/analyze-drive', '/analyze-gcs'];
+const jobs = new Map();
 
 const REQUIRED_PILLARS = [
   'Clareza de Objetivo e Direção Pedagógica',
@@ -42,6 +44,14 @@ const REQUIRED_PILLARS = [
 
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '50mb' }));
+
+process.on('uncaughtException', (error) => {
+  console.error('[uncaughtException]', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
 
 function parseServiceAccountJson() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
@@ -67,6 +77,46 @@ function logStageError(jobId, stage, error, data = {}) {
     gcsBucket: data.gcsBucket || null,
     gcsFileName: data.gcsFileName || null
   })}`);
+}
+
+function serializeJob(job) {
+  if (!job) return null;
+  return {
+    ok: true,
+    jobId: job.jobId,
+    status: job.status,
+    stage: job.stage,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    result: job.result || null,
+    error: job.error || null
+  };
+}
+
+function createJob(payload) {
+  const jobId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const job = {
+    jobId,
+    payload,
+    status: 'queued',
+    stage: 'queued',
+    createdAt: now,
+    updatedAt: now,
+    result: null,
+    error: null
+  };
+  jobs.set(jobId, job);
+  console.log(`[job:${jobId}] queued`);
+  return job;
+}
+
+function updateJob(jobId, patch) {
+  const current = jobs.get(jobId);
+  if (!current) return null;
+  const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+  jobs.set(jobId, next);
+  return next;
 }
 
 function buildFailureResponse(error, failedStage, details = {}) {
@@ -326,7 +376,7 @@ app.get('/health', async (_req, res) => {
     ok: true,
     service: 'aula-aberta-backend',
     model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-    routes: ['/health', '/analyze-gcs', '/analyze-drive'],
+    routes: ['/health', '/jobs/:jobId', '/analyze-gcs', '/analyze-drive'],
     binaries: {
       ffmpeg,
       ffprobe
@@ -341,10 +391,15 @@ app.get('/health', async (_req, res) => {
   });
 });
 app.get('/routes', (_req, res) => res.json({ ok: true, routes: ['/health', '/routes', '/default-prompt', '/debug-env', ...ANALYSIS_ROUTES] }));
+app.get('/jobs/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, message: 'Job nao encontrado', jobId: req.params.jobId });
+  return res.json(serializeJob(job));
+});
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
-async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName, sourceUrl, sourceUrlExpiresAt, videoValidation }) {
+async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName, sourceUrl, sourceUrlExpiresAt, videoValidation, jobId = null }) {
   logStage(recordingId, 'analysis_started', { localPath: videoPath, sourceFileName });
   const classContext = buildClassContext({ ...classContextInput, cameraId }, classContextInput);
   const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
@@ -413,6 +468,8 @@ ${partialAnalyses.join('\n\n')}`;
   const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'local').toLowerCase();
   let pdfUrl = null;
   let pdfPath = null;
+  if (jobId) updateJob(jobId, { status: 'processing', stage: 'report_generation' });
+  if (jobId) console.log(`[job:${jobId}] report_generation_started`);
   logStage(recordingId, 'report_generation_started', { provider: pdfUploadProvider });
   pdfPath = await generateLessonPdf(reportPayload).catch((error) => { throw withFailedStage(error, 'report_generation'); });
   logStage(recordingId, 'report_generated', { pdfPath });
@@ -462,63 +519,50 @@ app.post('/disabled-url-analysis', async (req, res) => {
   finally { if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath); }
 });
 
-app.post('/analyze-gcs', async (req, res) => {
-  let videoPath = null;
-  const endpoint = '/analyze-gcs';
-  const body = req.body || {};
+function normalizeAnalyzeGcsPayload(body = {}) {
   const parsedGcsUri = parseGcsUri(body.gcsUri || body.gcsURI || body.gsUri);
   const recordingId = normalizeField(body.recordingId, body.gcsFileName, body.fileName, `gcs_${Date.now()}`);
   const bucketName = normalizeField(body.bucketName, body.bucket, body.gcsBucket, parsedGcsUri.bucketName);
   const fileName = normalizeField(body.fileName, body.gcsPath, body.objectName, body.destination, body.gcsFileName, body.storagePath, parsedGcsUri.fileName);
-  const gcsBucket = bucketName;
-  const gcsFileName = fileName;
+  return { body, recordingId, bucketName, fileName, gcsBucket: bucketName, gcsFileName: fileName };
+}
 
-  console.log('[analyze-gcs] received');
-  console.log('[analyze-gcs] content-type:', req.headers['content-type']);
-  console.log('[analyze-gcs] body keys:', Object.keys(body || {}));
-  console.log(`[analyze-gcs] bucketName=${bucketName || null}`);
-  console.log(`[analyze-gcs] fileName=${fileName || null}`);
-
-  if (body && body.test) {
-    return res.json({
-      ok: true,
-      route: '/analyze-gcs',
-      bodyKeys: Object.keys(body || {}),
-      receivedBucketName: bucketName || null,
-      receivedFileName: fileName || null,
-      message: 'Rota analyze-gcs registrada e recebendo JSON.'
-    });
-  }
-
+async function runAnalyzeGcs(payload, jobId = null) {
+  let videoPath = null;
+  const endpoint = '/analyze-gcs';
+  const { body, recordingId, gcsBucket, gcsFileName } = normalizeAnalyzeGcsPayload(payload);
   try {
     console.log('[analyze-gcs] analysis_started');
     logStage(recordingId, 'analysis_request_started', { endpoint, gcsBucket, gcsFileName });
     if (!gcsBucket || !gcsFileName) {
       const error = new Error('bucketName/fileName sao obrigatorios.');
       logStageError(recordingId, 'analysis_request_failed', error, { endpoint, gcsBucket, gcsFileName });
-      return res.status(400).json({
-        ok: false,
-        failedStage: 'request_validation',
-        message: 'bucketName/fileName sao obrigatorios',
-        bodyKeys: Object.keys(body || {}),
-        receivedContentType: req.headers['content-type']
-      });
+      error.failedStage = 'request_validation';
+      throw error;
     }
 
+    if (jobId) updateJob(jobId, { status: 'processing', stage: 'download_gcs' });
+    if (jobId) console.log(`[job:${jobId}] download_gcs_started`);
     videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}_${path.basename(gcsFileName) || 'video.mp4'}`);
     logStage(recordingId, 'gcs_download_started', { endpoint, gcsBucket, gcsFileName, localPath: videoPath });
     await downloadFromGCS(gcsBucket, gcsFileName, videoPath).catch((error) => { throw withFailedStage(error, 'gcs_download'); });
     logStage(recordingId, 'gcs_download_success', { localPath: videoPath, fileSize: fs.statSync(videoPath).size });
+    if (jobId) console.log(`[job:${jobId}] download_gcs_success`);
 
+    if (jobId) updateJob(jobId, { status: 'processing', stage: 'video_validation' });
     logStage(recordingId, 'video_validation_started', { localPath: videoPath, gcsBucket, gcsFileName });
     const videoValidation = await validateVideoFile(videoPath);
     if (!videoValidation.valid) {
       const error = new Error(videoValidation.error || 'Video invalido.');
       logStageError(recordingId, 'video_validation_failed', error, { endpoint, localPath: videoPath, gcsBucket, gcsFileName });
-      return res.status(400).json(buildFailureResponse(error, 'video_validation', { endpoint, localPath: videoPath, gcsBucket, gcsFileName, videoValidation }));
+      error.failedStage = 'video_validation';
+      error.details = { endpoint, localPath: videoPath, gcsBucket, gcsFileName, videoValidation };
+      throw error;
     }
     logStage(recordingId, 'video_validation_success', { localPath: videoPath, videoValidation });
 
+    if (jobId) updateJob(jobId, { status: 'processing', stage: 'ai_analysis' });
+    if (jobId) console.log(`[job:${jobId}] analysis_started`);
     const analysis = await analyzeFromLocalVideo({
       videoPath,
       recordingId,
@@ -540,23 +584,110 @@ app.post('/analyze-gcs', async (req, res) => {
       recordingEndedAt: body.recordingEndedAt,
       sourceFileName: gcsFileName,
       sourceUrl: body.videoUrl || `gs://${gcsBucket}/${gcsFileName}`,
-      videoValidation
+      videoValidation,
+      jobId
     });
 
     console.log('[analyze-gcs] analysis_success');
-    return res.json({
+    const result = {
       ...analysis,
       videoFile: { bucket: gcsBucket, fileName: gcsFileName, localPath: videoPath, validation: videoValidation },
       metadata: { ...(analysis.metadata || {}), gcsBucket, gcsFileName }
-    });
+    };
+    if (jobId) {
+      console.log(`[job:${jobId}] report_generation_success`);
+      console.log(`[job:${jobId}] success`);
+    }
+    return result;
   } catch (error) {
     const failedStage = error.failedStage || 'analysis';
     console.error(`[analyze-gcs] analysis_failed stage=${failedStage} message=${error.message}`);
+    if (jobId) console.error(`[job:${jobId}] failed stage=${failedStage} message=${error.message}`);
     logStageError(recordingId, `${failedStage}_failed`, error, { endpoint, localPath: videoPath, gcsBucket, gcsFileName });
-    return res.status(error.statusCode || 500).json(buildFailureResponse(error, failedStage, { endpoint, localPath: videoPath, gcsBucket, gcsFileName, missingPillars: error.missingPillars || [] }));
+    throw error;
   } finally {
     if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
   }
+}
+
+async function processAnalyzeGcsJob(jobId, payload) {
+  try {
+    const result = await runAnalyzeGcs(payload, jobId);
+    updateJob(jobId, {
+      status: 'success',
+      stage: 'done',
+      result: {
+        reportUrl: result.reportUrl || result.drivePdfUrl || null,
+        reportPath: result.localPdfPath || result.reportUrl || null,
+        videoFile: result.videoFile || null,
+        metadata: result.metadata || null
+      },
+      error: null
+    });
+  } catch (error) {
+    const failedStage = error.failedStage || 'analysis';
+    updateJob(jobId, {
+      status: 'failed',
+      stage: failedStage,
+      error: {
+        message: error.message,
+        stack: error.stack || null,
+        details: error.details || null
+      }
+    });
+  }
+}
+
+app.post('/analyze-gcs', async (req, res) => {
+  const body = req.body || {};
+  const { bucketName, fileName } = normalizeAnalyzeGcsPayload(body);
+
+  console.log('[analyze-gcs] received');
+  console.log('[analyze-gcs] content-type:', req.headers['content-type']);
+  console.log('[analyze-gcs] body keys:', Object.keys(body || {}));
+  console.log(`[analyze-gcs] bucketName=${bucketName || null}`);
+  console.log(`[analyze-gcs] fileName=${fileName || null}`);
+
+  if (body && body.test) {
+    return res.json({
+      ok: true,
+      route: '/analyze-gcs',
+      bodyKeys: Object.keys(body || {}),
+      receivedBucketName: bucketName || null,
+      receivedFileName: fileName || null,
+      message: 'Rota analyze-gcs registrada e recebendo JSON.'
+    });
+  }
+
+  if (!bucketName || !fileName) {
+    return res.status(400).json({
+      ok: false,
+      failedStage: 'request_validation',
+      message: 'bucketName/fileName sao obrigatorios',
+      bodyKeys: Object.keys(body || {}),
+      receivedContentType: req.headers['content-type']
+    });
+  }
+
+  const job = createJob(body);
+  processAnalyzeGcsJob(job.jobId, body).catch((error) => {
+    updateJob(job.jobId, {
+      status: 'failed',
+      stage: 'unhandled_background_error',
+      error: {
+        message: error.message,
+        stack: error.stack || null
+      }
+    });
+  });
+
+  return res.status(202).json({
+    ok: true,
+    accepted: true,
+    jobId: job.jobId,
+    statusUrl: `/jobs/${job.jobId}`,
+    message: 'Analise recebida e iniciada em background'
+  });
 });
 
 app.post('/analyze-drive', async (req, res) => {
