@@ -53,8 +53,11 @@ const MAX_TIMEOUT_MS = 2147483647;
 const LATE_TOLERANCE_MS = 5 * 60 * 1000;
 const RECORDING_GRACE_SECONDS = Number(process.env.RECORDING_GRACE_SECONDS || 30);
 const FORCE_KILL_GRACE_SECONDS = Number(process.env.FORCE_KILL_GRACE_SECONDS || 15);
+const FILE_PROGRESS_INTERVAL_MS = 10000;
+const NO_OUTPUT_TIMEOUT_MS = Number(process.env.NO_OUTPUT_TIMEOUT_MS || 35000);
 
 const MAX_FFMPEG_LOG_CHARS = 20000;
+const MAX_FFMPEG_STDERR_LINES = 80;
 
 console.log('BINARIES', { FFMPEG_PATH, FFPROBE_PATH });
 
@@ -91,6 +94,13 @@ function forceKillProcessTree(pid) {
       return resolve(false);
     }
   });
+}
+
+function redactSecrets(text) {
+  if (!text) return text;
+  return String(text)
+    .replace(/rtsp:\/\/[^@\s]+@/gi, 'rtsp://[REDACTED]@')
+    .replace(/(password|pass|token|key)=([^&\s]+)/gi, '$1=[REDACTED]');
 }
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
@@ -790,16 +800,24 @@ function startRecordingJob(options) {
   const durationSeconds = Math.floor(Math.max(1, durationMinutes) * 60);
   const recordingId = crypto.randomUUID();
   const outputPath = providedOutputPath || path.join(RECORDINGS_DIR, `${recordingId}.mp4`);
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   const ffmpegArgs = buildFfmpegArgs(rtspUrl, durationSeconds, outputPath);
   const ffmpegCommand = `${FFMPEG_PATH} ${sanitizeCommandArgs(ffmpegArgs).join(' ')}`;
 
   console.log(`[recording:${recordingId}] Iniciando gravaÃ§Ã£o RTSP camera=${cameraId} duration=${durationSeconds}s source=${source}`);
   console.log(`[recording:${recordingId}] recording_started camera=${cameraId} duration=${durationSeconds}s source=${source}`);
+  console.log(`[recording:${recordingId}] outputPath=${outputPath}`);
   console.log(`[recording:${recordingId}] FFmpeg command: ${ffmpegCommand}`);
   const ffmpeg = spawn(FFMPEG_PATH, ffmpegArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
   let closeHandled = false;
+  let recordingFailed = false;
   let watchdogTimer = null;
   let forceKillTimer = null;
+  let fileProgressTimer = null;
+  let noOutputTimer = null;
+  let lastFileSize = 0;
+  let noOutputTicks = 0;
+  const ffmpegStderrLines = [];
 
   const rec = {
     id: recordingId,
@@ -843,8 +861,52 @@ function startRecordingJob(options) {
   activeRecordings.set(cameraId, recordingId);
   if (onStatus) onStatus(rec, 'recording');
 
-  ffmpeg.stderr.on('data', (chunk) => {
-    rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, chunk, MAX_FFMPEG_LOG_CHARS);
+  function getOutputFileState() {
+    const exists = fs.existsSync(outputPath);
+    const size = exists ? fs.statSync(outputPath).size : 0;
+    return { exists, size };
+  }
+
+  function logFfmpegTail() {
+    console.error(`[recording:${recordingId}] ffmpeg_tail:\n${ffmpegStderrLines.join('\n')}`);
+  }
+
+  function pushFfmpegStderr(chunk) {
+    const text = chunk.toString();
+    rec.ffmpegStderr = appendBoundedLog(rec.ffmpegStderr, text, MAX_FFMPEG_LOG_CHARS);
+    for (const line of text.split(/\r?\n/)) {
+      const clean = redactSecrets(line.trim());
+      if (!clean) continue;
+      ffmpegStderrLines.push(clean);
+      if (ffmpegStderrLines.length > MAX_FFMPEG_STDERR_LINES) {
+        ffmpegStderrLines.shift();
+      }
+    }
+  }
+
+  function markRecordingFailed(stage, error) {
+    if (recordingFailed) return;
+    recordingFailed = true;
+    const message = error?.message || String(error || '');
+    console.error(`[recording:${recordingId}] recording_failed stage=${stage} message=${message}`);
+    rec.status = 'failed';
+    rec.failedStage = stage;
+    rec.error = {
+      stage,
+      message,
+      ffmpegTail: ffmpegStderrLines.slice(-40),
+      outputPath
+    };
+    rec.errorDetails = {
+      ...buildErrorDetails(error, rec, stage),
+      ffmpegTail: ffmpegStderrLines.slice(-40),
+      outputPath
+    };
+    rec.fileSize = getFileSizeSafe(outputPath);
+  }
+
+  ffmpeg.stderr?.on('data', (chunk) => {
+    pushFfmpegStderr(chunk);
   });
 
   function handleFfmpegClosed(code, reason = 'close') {
@@ -852,14 +914,27 @@ function startRecordingJob(options) {
     closeHandled = true;
     if (watchdogTimer) clearTimeout(watchdogTimer);
     if (forceKillTimer) clearTimeout(forceKillTimer);
+    if (fileProgressTimer) clearInterval(fileProgressTimer);
+    if (noOutputTimer) clearTimeout(noOutputTimer);
 
     rec.finishedAt = new Date().toISOString();
     rec.ffmpegLastLog = getLogTail(rec.ffmpegStderr);
     console.log(`[recording:${recordingId}] ffmpeg_closed reason=${reason} code=${code}`);
     console.log(`[recording:${recordingId}] FFmpeg finalizou com cÃ³digo ${code}`);
-    console.log(`[recording:${recordingId}] recording_finished code=${code}`);
     if (rec.scheduleId) console.log(`[schedule:${rec.scheduleId}] Fim da gravaÃ§Ã£o cÃ³digo=${code}`);
     if (activeRecordings.get(cameraId) === recordingId) activeRecordings.delete(cameraId);
+    logFfmpegTail();
+
+    const outputState = getOutputFileState();
+    if (!outputState.exists || outputState.size === 0) {
+      markRecordingFailed('recording_no_file', new Error(`Arquivo de gravaÃƒÂ§ÃƒÂ£o nÃƒÂ£o foi criado ou estÃƒÂ¡ vazio: ${outputPath}`));
+    }
+
+    if (recordingFailed) {
+      if (onStatus) onStatus(rec, 'failed', rec.errorDetails);
+      startNextRecordingForCamera(cameraId);
+      return;
+    }
 
     if (reason === 'forced_timeout') {
       const details = setRecordingError(rec, 'recording_timeout', new Error('FFmpeg nÃ£o emitiu close apÃ³s force kill.'));
@@ -881,7 +956,8 @@ function startRecordingJob(options) {
       return;
     }
 
-    rec.fileSize = getFileSizeSafe(rec.outputPath);
+    console.log(`[recording:${recordingId}] recording_finished code=${code}`);
+    rec.fileSize = outputState.size;
     rec.status = 'recorded';
     if (onStatus) onStatus(rec, 'recorded');
     enqueueProcessingJob(recordingId);
@@ -902,12 +978,57 @@ function startRecordingJob(options) {
     closeHandled = true;
     if (watchdogTimer) clearTimeout(watchdogTimer);
     if (forceKillTimer) clearTimeout(forceKillTimer);
+    if (fileProgressTimer) clearInterval(fileProgressTimer);
+    if (noOutputTimer) clearTimeout(noOutputTimer);
     rec.ffmpegLastLog = getLogTail(rec.ffmpegStderr);
+    logFfmpegTail();
     if (activeRecordings.get(cameraId) === recordingId) activeRecordings.delete(cameraId);
     const details = setRecordingError(rec, 'starting_ffmpeg', error);
     if (onStatus) onStatus(rec, 'failed', details);
     startNextRecordingForCamera(cameraId);
   });
+
+  fileProgressTimer = setInterval(() => {
+    const { exists, size } = getOutputFileState();
+    const grew = size > lastFileSize;
+    console.log(`[recording:${recordingId}] file_progress exists=${exists} size=${size} grew=${grew}`);
+
+    if (!exists || size === 0) {
+      noOutputTicks += 1;
+    }
+
+    lastFileSize = size;
+  }, FILE_PROGRESS_INTERVAL_MS);
+
+  noOutputTimer = setTimeout(() => {
+    if (closeHandled || recordingFailed) return;
+    const { exists, size } = getOutputFileState();
+
+    if (!exists || size === 0) {
+      console.error(`[recording:${recordingId}] no_output_timeout outputPath=${outputPath} exists=${exists} size=${size}`);
+      logFfmpegTail();
+      markRecordingFailed('recording_no_file', new Error(`FFmpeg nÃ£o criou arquivo de saÃ­da apÃ³s ${NO_OUTPUT_TIMEOUT_MS}ms`));
+
+      try {
+        ffmpeg.kill('SIGINT');
+        console.error(`[recording:${recordingId}] sigint_sent pid=${ffmpeg.pid} reason=no_output_timeout`);
+      } catch (error) {
+        console.error(`[recording:${recordingId}] Erro ao enviar SIGINT apÃ³s no_output_timeout: ${error.message}`);
+      }
+      const noOutputForceKillMs = (Number.isFinite(FORCE_KILL_GRACE_SECONDS) && FORCE_KILL_GRACE_SECONDS >= 0 ? FORCE_KILL_GRACE_SECONDS : 15) * 1000;
+      forceKillTimer = setTimeout(async () => {
+        if (closeHandled) return;
+
+        console.error(`[recording:${recordingId}] force_kill_timeout. Matando FFmpeg pid=${ffmpeg.pid} reason=no_output_timeout`);
+        await forceKillProcessTree(ffmpeg.pid);
+
+        setTimeout(() => {
+          if (closeHandled) return;
+          handleFfmpegClosed(1, 'forced_timeout');
+        }, 3000);
+      }, noOutputForceKillMs);
+    }
+  }, NO_OUTPUT_TIMEOUT_MS);
 
   const safeRecordingGraceSeconds = Number.isFinite(RECORDING_GRACE_SECONDS) && RECORDING_GRACE_SECONDS >= 0 ? RECORDING_GRACE_SECONDS : 30;
   const safeForceKillGraceSeconds = Number.isFinite(FORCE_KILL_GRACE_SECONDS) && FORCE_KILL_GRACE_SECONDS >= 0 ? FORCE_KILL_GRACE_SECONDS : 15;
