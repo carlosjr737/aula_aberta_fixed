@@ -163,6 +163,18 @@ function normalizeField(...values) {
   return '';
 }
 
+function parseGcsUri(gcsUri) {
+  const text = normalizeField(gcsUri);
+  const match = text.match(/^gs:\/\/([^/]+)\/(.+)$/i);
+  if (!match) return {};
+  return { bucketName: match[1], fileName: match[2] };
+}
+
+function withFailedStage(error, failedStage) {
+  if (error && !error.failedStage) error.failedStage = failedStage;
+  return error;
+}
+
 function buildClassContext(input = {}, scheduleFallback = {}) {
   const source = { ...scheduleFallback, ...input };
   return {
@@ -255,10 +267,10 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
   validatePromptHasFullDNA(finalPrompt);
   const metadata = { ...classContext, cameraId, recordingId };
   logStage(recordingId, 'gemini_upload_started', { localPath: videoPath });
-  const file = await uploadToGemini(videoPath, 'video/mp4');
-  const active = await waitForGeminiActive(file.name);
+  const file = await uploadToGemini(videoPath, 'video/mp4').catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
+  const active = await waitForGeminiActive(file.name).catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
   logStage(recordingId, 'gemini_upload_success', { geminiFile: file.name });
-  const tokenCount = await countVideoTokens(active.uri, finalPrompt, metadata);
+  const tokenCount = await countVideoTokens(active.uri, finalPrompt, metadata).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
   console.log(`[analysis:${recordingId}] tokenCount estimado=${tokenCount}`);
   let rawResponse = '';
   let strategy = 'single';
@@ -266,7 +278,7 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
 
   if (tokenCount <= TOKEN_SINGLE_ANALYSIS_LIMIT) {
     console.log(`[analysis:${recordingId}] estratégia=inteiro`);
-    rawResponse = await analyzeVideo(active.uri, finalPrompt, metadata);
+    rawResponse = await analyzeVideo(active.uri, finalPrompt, metadata).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
   } else {
     strategy = 'segmented';
     console.log(`[analysis:${recordingId}] estratégia=segmentado`);
@@ -277,8 +289,8 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
     for (let index = 0; index < segments.length; index += 1) {
       const segmentPath = segments[index];
       console.log(`[analysis:${recordingId}] início análise parcial segmento ${index + 1}/${segmentCount}`);
-      const segmentUpload = await uploadToGemini(segmentPath, 'video/mp4');
-      const segmentActive = await waitForGeminiActive(segmentUpload.name);
+      const segmentUpload = await uploadToGemini(segmentPath, 'video/mp4').catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
+      const segmentActive = await waitForGeminiActive(segmentUpload.name).catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
       const partialPrompt = `${finalPrompt}
 
 ANÁLISE PARCIAL DE BLOCO TEMPORAL:
@@ -286,7 +298,7 @@ ANÁLISE PARCIAL DE BLOCO TEMPORAL:
 - Responda apenas com análise parcial deste bloco.
 - Inclua horários aproximados dentro deste bloco (ex.: minuto 02:30), evidências observáveis e notas parciais por pilares quando aplicável.
 - Não conclua o relatório final ainda.`;
-      const partialText = await analyzeVideo(segmentActive.uri, partialPrompt, { ...metadata, segmentIndex: index + 1, segmentCount });
+      const partialText = await analyzeVideo(segmentActive.uri, partialPrompt, { ...metadata, segmentIndex: index + 1, segmentCount }).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
       partialAnalyses.push(`BLOCO ${index + 1}/${segmentCount}:\n${partialText}`);
       console.log(`[analysis:${recordingId}] fim análise parcial segmento ${index + 1}/${segmentCount}`);
       if (fs.existsSync(segmentPath)) fs.unlinkSync(segmentPath);
@@ -298,7 +310,7 @@ CONSOLIDE AS ANÁLISES PARCIAIS ABAIXO EM UM RELATÓRIO FINAL COMPLETO COM OS 12
 Mantenha evidências observáveis, progressão temporal, síntese executiva e plano de evolução.
 
 ${partialAnalyses.join('\n\n')}`;
-    rawResponse = await analyzeText(consolidationPrompt);
+    rawResponse = await analyzeText(consolidationPrompt).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
     console.log(`[analysis:${recordingId}] fim consolidação final`);
   }
   const noClassDetected = detectNoClass(rawResponse);
@@ -310,10 +322,10 @@ ${partialAnalyses.join('\n\n')}`;
   let pdfUrl = null;
   let pdfPath = null;
   logStage(recordingId, 'report_generation_started', { provider: pdfUploadProvider });
-  pdfPath = await generateLessonPdf(reportPayload);
+  pdfPath = await generateLessonPdf(reportPayload).catch((error) => { throw withFailedStage(error, 'report_generation'); });
   logStage(recordingId, 'report_generated', { pdfPath });
   if (pdfUploadProvider === 'drive') {
-    const driveData = await uploadPdf(pdfPath, { professor: classContext.professor });
+    const driveData = await uploadPdf(pdfPath, { professor: classContext.professor }).catch((error) => { throw withFailedStage(error, 'drive_upload'); });
     pdfUrl = driveData?.webViewLink || null;
     logStage(recordingId, 'report_upload_success', { provider: 'drive', reportUrl: pdfUrl });
   }
@@ -362,16 +374,18 @@ app.post('/analyze-gcs', async (req, res) => {
   let videoPath = null;
   const endpoint = '/analyze-gcs';
   const body = req.body || {};
+  const parsedGcsUri = parseGcsUri(body.gcsUri || body.gcsURI || body.gsUri);
   const recordingId = normalizeField(body.recordingId, body.gcsFileName, body.fileName, `gcs_${Date.now()}`);
-  const bucketName = normalizeField(body.bucketName, body.bucket, body.gcsBucket);
-  const fileName = normalizeField(body.fileName, body.gcsPath, body.objectName, body.destination, body.gcsFileName, body.storagePath);
+  const bucketName = normalizeField(body.bucketName, body.bucket, body.gcsBucket, parsedGcsUri.bucketName);
+  const fileName = normalizeField(body.fileName, body.gcsPath, body.objectName, body.destination, body.gcsFileName, body.storagePath, parsedGcsUri.fileName);
   const gcsBucket = bucketName;
   const gcsFileName = fileName;
 
+  console.log('[analyze-gcs] received');
   console.log('[analyze-gcs] content-type:', req.headers['content-type']);
   console.log('[analyze-gcs] body keys:', Object.keys(body || {}));
-  console.log('[analyze-gcs] bucketName:', bucketName || null);
-  console.log('[analyze-gcs] fileName:', fileName || null);
+  console.log(`[analyze-gcs] bucketName=${bucketName || null}`);
+  console.log(`[analyze-gcs] fileName=${fileName || null}`);
 
   if (body && body.test) {
     return res.json({
@@ -385,6 +399,7 @@ app.post('/analyze-gcs', async (req, res) => {
   }
 
   try {
+    console.log('[analyze-gcs] analysis_started');
     logStage(recordingId, 'analysis_request_started', { endpoint, gcsBucket, gcsFileName });
     if (!gcsBucket || !gcsFileName) {
       const error = new Error('bucketName/fileName sao obrigatorios.');
@@ -399,9 +414,9 @@ app.post('/analyze-gcs', async (req, res) => {
     }
 
     videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}_${path.basename(gcsFileName) || 'video.mp4'}`);
-    logStage(recordingId, 'download_started', { endpoint, gcsBucket, gcsFileName, localPath: videoPath });
-    await downloadFromGCS(gcsBucket, gcsFileName, videoPath);
-    logStage(recordingId, 'download_success', { localPath: videoPath, fileSize: fs.statSync(videoPath).size });
+    logStage(recordingId, 'gcs_download_started', { endpoint, gcsBucket, gcsFileName, localPath: videoPath });
+    await downloadFromGCS(gcsBucket, gcsFileName, videoPath).catch((error) => { throw withFailedStage(error, 'gcs_download'); });
+    logStage(recordingId, 'gcs_download_success', { localPath: videoPath, fileSize: fs.statSync(videoPath).size });
 
     logStage(recordingId, 'video_validation_started', { localPath: videoPath, gcsBucket, gcsFileName });
     const videoValidation = await validateVideoFile(videoPath);
@@ -436,14 +451,17 @@ app.post('/analyze-gcs', async (req, res) => {
       videoValidation
     });
 
+    console.log('[analyze-gcs] analysis_success');
     return res.json({
       ...analysis,
       videoFile: { bucket: gcsBucket, fileName: gcsFileName, localPath: videoPath, validation: videoValidation },
       metadata: { ...(analysis.metadata || {}), gcsBucket, gcsFileName }
     });
   } catch (error) {
-    logStageError(recordingId, 'analysis_failed', error, { endpoint, localPath: videoPath, gcsBucket, gcsFileName });
-    return res.status(error.statusCode || 500).json(buildFailureResponse(error, 'analysis', { endpoint, localPath: videoPath, gcsBucket, gcsFileName, missingPillars: error.missingPillars || [] }));
+    const failedStage = error.failedStage || 'analysis';
+    console.error(`[analyze-gcs] analysis_failed stage=${failedStage} message=${error.message}`);
+    logStageError(recordingId, `${failedStage}_failed`, error, { endpoint, localPath: videoPath, gcsBucket, gcsFileName });
+    return res.status(error.statusCode || 500).json(buildFailureResponse(error, failedStage, { endpoint, localPath: videoPath, gcsBucket, gcsFileName, missingPillars: error.missingPillars || [] }));
   } finally {
     if (videoPath && fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
   }

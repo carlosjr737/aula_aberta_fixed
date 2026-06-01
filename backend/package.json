@@ -4,8 +4,8 @@
   "description": "Backend pesado para análise de vídeos do DK Aula IA",
   "main": "server.js",
   "scripts": {
-    "start": "node -r ./register-analyze-gcs.js server.js",
-    "dev": "node -r ./register-analyze-gcs.js server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "engines": {
     "node": ">=20"
@@ -15,7 +15,6 @@
     "express": "^4.21.2",
     "ffprobe-static": "^3.1.0",
     "googleapis": "^144.0.0",
-    "pdfkit": "^0.15.0",
-    "@google-cloud/storage": "^7.16.0"
+    "pdfkit": "^0.15.0"
   }
 }
