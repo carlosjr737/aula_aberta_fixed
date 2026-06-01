@@ -72,11 +72,14 @@ function buildFailureResponse(error, failedStage, details = {}) {
     ok: false,
     failedStage,
     message: error?.message || String(error || ''),
+    reportPath: error?.reportPath || details.reportPath || null,
     details: {
       ...details,
       stack: error?.stack || null,
       httpStatus: error?.status || error?.statusCode || null,
-      responseText: error?.responseText || null
+      responseText: error?.responseText || null,
+      reportPath: error?.reportPath || details.reportPath || null,
+      reportDir: error?.reportDir || details.reportDir || null
     }
   };
 }
@@ -317,6 +320,8 @@ ${partialAnalyses.join('\n\n')}`;
   const status = noClassDetected ? 'completed_no_class_detected' : 'completed';
 
   const reportPayload = { recordingId, professor: classContext.professor, turma: classContext.turma, nivel: classContext.nivel, sala: classContext.sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
+
+  reportPayload.sourceFileName = sourceFileName;
 
   const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'local').toLowerCase();
   let pdfUrl = null;
