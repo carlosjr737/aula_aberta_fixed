@@ -3,7 +3,7 @@ const cors = require('cors');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
@@ -11,12 +11,14 @@ const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVid
 const { DNA_PROFESSOR_DK_FULL_OPERATIONAL } = require('./prompts/dnaProfessorDKFullOperational');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
-let ffprobePath = 'ffprobe';
-try { ffprobePath = require('ffprobe-static').path || 'ffprobe'; } catch (_error) { ffprobePath = 'ffprobe'; }
+let ffprobeStaticPath = 'ffprobe';
+try { ffprobeStaticPath = require('ffprobe-static').path || 'ffprobe'; } catch (_error) { ffprobeStaticPath = 'ffprobe'; }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const execFileAsync = promisify(execFile);
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE_PATH = process.env.FFPROBE_PATH || ffprobeStaticPath || 'ffprobe';
 const TOKEN_SINGLE_ANALYSIS_LIMIT = 900000;
 const MIN_VALIDATION_FILE_SIZE_BYTES = 50 * 1024;
 const FFPROBE_FALLBACK_FILE_SIZE_BYTES = 100 * 1024;
@@ -75,6 +77,7 @@ function buildFailureResponse(error, failedStage, details = {}) {
     reportPath: error?.reportPath || details.reportPath || null,
     details: {
       ...details,
+      ...(error?.details || {}),
       stack: error?.stack || null,
       httpStatus: error?.status || error?.statusCode || null,
       responseText: error?.responseText || null,
@@ -96,7 +99,7 @@ async function validateVideoFileLegacy(filePath) {
   if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo inválido (${fileSize} bytes).` };
 
   try {
-    const { stdout, stderr } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    const { stdout, stderr } = await execFileAsync(FFPROBE_PATH, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
     if (stderr && /moov atom not found/i.test(stderr)) return { valid: false, fileSize, error: 'Arquivo invalido: moov atom not found.', ffprobeStderr: stderr };
     const probe = JSON.parse(stdout || '{}');
     const streams = Array.isArray(probe.streams) ? probe.streams : [];
@@ -129,7 +132,7 @@ async function validateVideoFile(filePath) {
   if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo invalido (${fileSize} bytes).` };
 
   try {
-    const { stdout, stderr } = await execFileAsync(ffprobePath, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
+    const { stdout, stderr } = await execFileAsync(FFPROBE_PATH, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
     if (stderr && /moov atom not found/i.test(stderr)) return { valid: false, fileSize, error: 'Arquivo invalido: moov atom not found.', ffprobeStderr: stderr };
     const probe = JSON.parse(stdout || '{}');
     const streams = Array.isArray(probe.streams) ? probe.streams : [];
@@ -176,6 +179,58 @@ function parseGcsUri(gcsUri) {
 function withFailedStage(error, failedStage) {
   if (error && !error.failedStage) error.failedStage = failedStage;
   return error;
+}
+
+function checkBinary(command, args = ['-version']) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errorOutput = '';
+    let settled = false;
+
+    child.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk) => {
+      errorOutput += chunk.toString();
+    });
+
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        ok: false,
+        command,
+        message: error.message
+      });
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        ok: code === 0,
+        command,
+        code,
+        version: (output || errorOutput).split('\n')[0]
+      });
+    });
+  });
+}
+
+async function assertFfmpegAvailable() {
+  const ffmpeg = await checkBinary(FFMPEG_PATH);
+  if (ffmpeg.ok) return ffmpeg;
+
+  const error = new Error('FFmpeg nao encontrado no backend Railway');
+  error.failedStage = 'binary_check';
+  error.details = {
+    ffmpeg,
+    FFMPEG_PATH,
+    suggestion: 'Instale ffmpeg via backend/nixpacks.toml ou configure FFMPEG_PATH'
+  };
+  throw error;
 }
 
 function buildClassContext(input = {}, scheduleFallback = {}) {
@@ -239,7 +294,20 @@ function detectNoClass(rawResponse = '') {
 
 async function segmentVideo(videoPath, segmentSeconds = 600) {
   const segmentPrefix = path.join(os.tmpdir(), `dk_segment_${Date.now()}_${path.basename(videoPath, path.extname(videoPath))}`);
-  await execFileAsync('ffmpeg', ['-hide_banner', '-y', '-i', videoPath, '-c', 'copy', '-f', 'segment', '-segment_time', String(segmentSeconds), '-reset_timestamps', '1', `${segmentPrefix}_%03d.mp4`]);
+  await assertFfmpegAvailable();
+  await execFileAsync(FFMPEG_PATH, ['-hide_banner', '-y', '-i', videoPath, '-c', 'copy', '-f', 'segment', '-segment_time', String(segmentSeconds), '-reset_timestamps', '1', `${segmentPrefix}_%03d.mp4`])
+    .catch((error) => {
+      if (error?.code === 'ENOENT' || /spawn .*ffmpeg.*ENOENT/i.test(error?.message || '')) {
+        const binaryError = new Error('FFmpeg nao encontrado no backend Railway');
+        binaryError.failedStage = 'binary_check';
+        binaryError.details = {
+          FFMPEG_PATH,
+          suggestion: 'Instale ffmpeg via backend/nixpacks.toml ou configure FFMPEG_PATH'
+        };
+        throw binaryError;
+      }
+      throw withFailedStage(error, 'ffmpeg_preprocess');
+    });
   const files = fs.readdirSync(os.tmpdir())
     .filter((name) => name.startsWith(path.basename(segmentPrefix)) && name.endsWith('.mp4'))
     .map((name) => path.join(os.tmpdir(), name))
@@ -248,17 +316,30 @@ async function segmentVideo(videoPath, segmentSeconds = 600) {
   return files;
 }
 
-app.get('/health', (_req, res) => res.json({
-  ok: true,
-  service: 'aula-aberta-backend',
-  model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-  routes: ['/health', '/analyze-gcs', '/analyze-drive'],
-  env: {
-    GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY),
-    GOOGLE_APPLICATION_CREDENTIALS: Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS),
-    GCS_BUCKET: Boolean(process.env.GCS_BUCKET)
-  }
-}));
+app.get('/health', async (_req, res) => {
+  const [ffmpeg, ffprobe] = await Promise.all([
+    checkBinary(FFMPEG_PATH),
+    checkBinary(FFPROBE_PATH)
+  ]);
+
+  res.json({
+    ok: true,
+    service: 'aula-aberta-backend',
+    model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    routes: ['/health', '/analyze-gcs', '/analyze-drive'],
+    binaries: {
+      ffmpeg,
+      ffprobe
+    },
+    env: {
+      GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY),
+      GOOGLE_APPLICATION_CREDENTIALS: Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS),
+      GCS_BUCKET: Boolean(process.env.GCS_BUCKET),
+      FFMPEG_PATH: process.env.FFMPEG_PATH || null,
+      FFPROBE_PATH: process.env.FFPROBE_PATH || null
+    }
+  });
+});
 app.get('/routes', (_req, res) => res.json({ ok: true, routes: ['/health', '/routes', '/default-prompt', '/debug-env', ...ANALYSIS_ROUTES] }));
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
@@ -269,6 +350,10 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
   const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
   validatePromptHasFullDNA(finalPrompt);
   const metadata = { ...classContext, cameraId, recordingId };
+  const videoFileSize = videoPath && fs.existsSync(videoPath) ? fs.statSync(videoPath).size : null;
+  const videoDurationSeconds = Number(videoValidation?.duration || videoValidation?.formatDuration || 0) || null;
+  console.log(`[analysis:${recordingId}] video_duration_seconds=${videoDurationSeconds || null}`);
+  console.log(`[analysis:${recordingId}] video_file_size=${videoFileSize || null}`);
   logStage(recordingId, 'gemini_upload_started', { localPath: videoPath });
   const file = await uploadToGemini(videoPath, 'video/mp4').catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
   const active = await waitForGeminiActive(file.name).catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
@@ -281,10 +366,12 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
 
   if (tokenCount <= TOKEN_SINGLE_ANALYSIS_LIMIT) {
     console.log(`[analysis:${recordingId}] estratégia=inteiro`);
+    console.log(`[analysis:${recordingId}] analysis_strategy=direct_gemini ffmpeg_required=false`);
     rawResponse = await analyzeVideo(active.uri, finalPrompt, metadata).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
   } else {
     strategy = 'segmented';
     console.log(`[analysis:${recordingId}] estratégia=segmentado`);
+    console.log(`[analysis:${recordingId}] analysis_strategy=compressed_video ffmpeg_required=true`);
     const segments = await segmentVideo(videoPath, 600);
     segmentCount = segments.length;
     console.log(`[analysis:${recordingId}] segmentos=${segmentCount}`);
