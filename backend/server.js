@@ -81,6 +81,13 @@ function logStageError(jobId, stage, error, data = {}) {
 
 function serializeJob(job) {
   if (!job) return null;
+  const result = job.result ? { ...job.result } : null;
+  if (result && !result.downloadUrl && result.reportPath) {
+    result.downloadUrl = `/jobs/${job.jobId}/report`;
+  }
+  if (result && !result.reportUrl && result.downloadUrl) {
+    result.reportUrl = result.downloadUrl;
+  }
   return {
     ok: true,
     jobId: job.jobId,
@@ -88,7 +95,7 @@ function serializeJob(job) {
     stage: job.stage,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
-    result: job.result || null,
+    result,
     error: job.error || null
   };
 }
@@ -140,8 +147,36 @@ function buildFailureResponse(error, failedStage, details = {}) {
 function extractDriveFileId(input) { if (!input) return null; if (/^[a-zA-Z0-9_-]{20,}$/.test(input)) return input; const m = String(input).match(/\/d\/([a-zA-Z0-9_-]+)/); return m?.[1] || null; }
 function getDriveClientRO() { const credentials = parseServiceAccountJson(); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/drive.readonly'] }); return google.drive({ version: 'v3', auth }); }
 function getGcsClientRO() { const credentials = parseServiceAccountJson(); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/devstorage.read_only'] }); return google.storage({ version: 'v1', auth }); }
+function getGcsClientRW() { const credentials = parseServiceAccountJson(); const auth = new google.auth.GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/devstorage.read_write'] }); return google.storage({ version: 'v1', auth }); }
+function getReportsBucketName() { return String(process.env.GCS_BUCKET_NAME || process.env.GCS_BUCKET || '').trim(); }
 async function downloadFromDrive(fileId, destPath) { const drive = getDriveClientRO(); const res = await drive.files.get({ fileId, alt: 'media', supportsAllDrives: true }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
 async function downloadFromGCS(bucketName, fileName, destPath) { const storage = getGcsClientRO(); const res = await storage.objects.get({ bucket: bucketName, object: fileName, alt: 'media' }, { responseType: 'stream' }); await pipeline(res.data, fs.createWriteStream(destPath)); }
+async function streamGcsObjectToResponse(bucketName, fileName, res) {
+  const storage = getGcsClientRO();
+  const response = await storage.objects.get({ bucket: bucketName, object: fileName, alt: 'media' }, { responseType: 'stream' });
+  await pipeline(response.data, res);
+}
+async function uploadPdfToGCS(filePath, { bucketName, objectName }) {
+  const storage = getGcsClientRW();
+  const bucket = bucketName || getReportsBucketName();
+  if (!bucket) throw new Error('GCS_BUCKET_NAME/GCS_BUCKET nao configurado para upload do PDF.');
+  const media = { mimeType: 'application/pdf', body: fs.createReadStream(filePath) };
+  const request = {
+    bucket,
+    uploadType: 'media',
+    requestBody: { name: objectName, contentType: 'application/pdf' },
+    media,
+    fields: 'bucket,name,mediaLink'
+  };
+  const response = await storage.objects.insert(request);
+  const data = response?.data || response || {};
+  return {
+    bucket: data.bucket || bucket,
+    key: data.name || objectName,
+    mediaLink: data.mediaLink || null,
+    gcsUri: `gs://${data.bucket || bucket}/${data.name || objectName}`
+  };
+}
 async function downloadFromUrl(url, destPath) { const response = await fetch(url); if (!response.ok) throw new Error(`Falha ao baixar vídeo URL: ${response.status}`); await pipeline(response.body, fs.createWriteStream(destPath)); }
 async function validateVideoFileLegacy(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return { valid: false, fileSize: 0, error: 'Arquivo não encontrado.' };
@@ -376,7 +411,7 @@ app.get('/health', async (_req, res) => {
     ok: true,
     service: 'aula-aberta-backend',
     model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-    routes: ['/health', '/jobs/:jobId', '/analyze-gcs', '/analyze-drive'],
+    routes: ['/health', '/jobs/:jobId', '/jobs/:jobId/report', '/analyze-gcs', '/analyze-drive'],
     binaries: {
       ffmpeg,
       ffprobe
@@ -390,11 +425,71 @@ app.get('/health', async (_req, res) => {
     }
   });
 });
-app.get('/routes', (_req, res) => res.json({ ok: true, routes: ['/health', '/routes', '/default-prompt', '/debug-env', ...ANALYSIS_ROUTES] }));
+app.get('/routes', (_req, res) => res.json({ ok: true, routes: ['/health', '/routes', '/default-prompt', '/debug-env', '/jobs/:jobId/report', ...ANALYSIS_ROUTES] }));
 app.get('/jobs/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ ok: false, message: 'Job nao encontrado', jobId: req.params.jobId });
   return res.json(serializeJob(job));
+});
+app.get('/jobs/:jobId/report', async (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({
+      ok: false,
+      message: 'Job não encontrado'
+    });
+  }
+
+  if (job.status !== 'success') {
+    return res.status(400).json({
+      ok: false,
+      message: 'Relatório ainda não está disponível',
+      status: job.status,
+      stage: job.stage,
+      error: job.error || null
+    });
+  }
+
+  const reportPath = job.result?.reportPath || null;
+  const reportGcsUri = job.result?.reportGcsUri || null;
+  const reportFileName = job.result?.reportFileName || null;
+  const reportBucket = job.result?.reportBucket || null;
+
+  if (reportPath && fs.existsSync(reportPath)) {
+    return res.download(reportPath, path.basename(reportPath));
+  }
+
+  const parsedGcsUri = parseGcsUri(reportGcsUri);
+  const bucketName = reportBucket || parsedGcsUri.bucketName || null;
+  const objectName = reportFileName || parsedGcsUri.fileName || null;
+
+  if (!bucketName || !objectName) {
+    return res.status(404).json({
+      ok: false,
+      message: 'Arquivo PDF não encontrado no servidor',
+      reportPath,
+      reportGcsUri,
+      suggestion: 'O arquivo pode ter sido perdido após restart/deploy. Use upload para GCS como armazenamento definitivo.'
+    });
+  }
+
+  try {
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(objectName)}"`);
+    await streamGcsObjectToResponse(bucketName, objectName, res);
+  } catch (error) {
+    if (!res.headersSent) {
+      return res.status(500).json({
+        ok: false,
+        message: 'Falha ao baixar relatório do GCS',
+        reportGcsUri,
+        bucketName,
+        fileName: objectName,
+        error: error.message
+      });
+    }
+    res.destroy(error);
+  }
 });
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
@@ -467,16 +562,35 @@ ${partialAnalyses.join('\n\n')}`;
 
   const pdfUploadProvider = String(process.env.PDF_UPLOAD_PROVIDER || 'local').toLowerCase();
   let pdfUrl = null;
+  let drivePdfUrl = null;
   let pdfPath = null;
+  let reportBucket = null;
+  let reportFileName = null;
+  let reportGcsUri = null;
+  let signedReportUrl = null;
+  let reportDownloadUrl = jobId ? `/jobs/${jobId}/report` : null;
   if (jobId) updateJob(jobId, { status: 'processing', stage: 'report_generation' });
   if (jobId) console.log(`[job:${jobId}] report_generation_started`);
   logStage(recordingId, 'report_generation_started', { provider: pdfUploadProvider });
   pdfPath = await generateLessonPdf(reportPayload).catch((error) => { throw withFailedStage(error, 'report_generation'); });
   logStage(recordingId, 'report_generated', { pdfPath });
+  if (jobId) console.log(`[job:${jobId}] report_upload_started`);
+  logStage(recordingId, 'report_upload_started', { provider: 'gcs', reportPath: pdfPath });
+  const reportBucketName = getReportsBucketName();
+  const reportObjectName = path.posix.join('reports', jobId || recordingId || `report_${Date.now()}`, path.basename(pdfPath));
+  const gcsUpload = await uploadPdfToGCS(pdfPath, { bucketName: reportBucketName, objectName: reportObjectName }).catch((error) => { throw withFailedStage(error, 'report_upload'); });
+  reportBucket = gcsUpload.bucket;
+  reportFileName = gcsUpload.key;
+  reportGcsUri = gcsUpload.gcsUri;
+  pdfUrl = reportDownloadUrl;
+  logStage(recordingId, 'report_upload_success', { provider: 'gcs', reportUrl: pdfUrl, reportGcsUri, reportBucket, reportFileName });
+  if (jobId) console.log(`[job:${jobId}] report_upload_success reportGcsUri=${reportGcsUri}`);
+  if (jobId) console.log(`[job:${jobId}] download_url_ready ${reportDownloadUrl}`);
   if (pdfUploadProvider === 'drive') {
     const driveData = await uploadPdf(pdfPath, { professor: classContext.professor }).catch((error) => { throw withFailedStage(error, 'drive_upload'); });
-    pdfUrl = driveData?.webViewLink || null;
-    logStage(recordingId, 'report_upload_success', { provider: 'drive', reportUrl: pdfUrl });
+    drivePdfUrl = driveData?.webViewLink || null;
+    if (!pdfUrl) pdfUrl = drivePdfUrl;
+    logStage(recordingId, 'report_upload_success', { provider: 'drive', reportUrl: drivePdfUrl });
   }
   if (pdfUploadProvider === 'drive' && pdfPath && fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
 
@@ -488,16 +602,23 @@ ${partialAnalyses.join('\n\n')}`;
     videoFileName: sourceFileName || recordingId,
     reportText: rawResponse,
     localJsonPath: null,
-    localPdfPath: pdfUploadProvider === 'drive' ? null : pdfPath,
-    reportUrl: pdfUrl || (pdfUploadProvider === 'drive' ? null : pdfPath),
-    drivePdfUrl: null,
+    localPdfPath: pdfPath,
+    reportPath: pdfPath,
+    reportUrl: pdfUrl || reportDownloadUrl || (pdfUploadProvider === 'drive' ? null : pdfPath),
+    downloadUrl: reportDownloadUrl,
+    reportBucket,
+    reportFileName,
+    reportGcsUri,
+    signedReportUrl,
+    drivePdfUrl,
     driveJsonUrl: null,
     metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
     video: { fileName: sourceFileName || recordingId, sourceUrl: sourceUrl || null, sourceUrlExpiresAt: sourceUrlExpiresAt || null, validation: videoValidation || null },
     prompt: { dnaVersion: '1.0', promptTemplateVersion: '2.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
     analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status, tokenCount, strategy, segmentCount }
   };
-  if (pdfUrl) responsePayload.drivePdfUrl = pdfUrl;
+  if (drivePdfUrl) responsePayload.drivePdfUrl = drivePdfUrl;
+  if (reportDownloadUrl) responsePayload.downloadUrl = reportDownloadUrl;
   logStage(recordingId, 'analysis_completed', { status, reportUrl: responsePayload.reportUrl || responsePayload.drivePdfUrl || null });
   return responsePayload;
 }
@@ -644,8 +765,14 @@ async function processAnalyzeGcsJob(jobId, payload) {
       status: 'success',
       stage: 'done',
       result: {
-        reportUrl: result.reportUrl || result.drivePdfUrl || null,
-        reportPath: result.localPdfPath || result.reportUrl || null,
+        reportUrl: result.reportUrl || result.downloadUrl || result.drivePdfUrl || null,
+        reportPath: result.reportPath || result.localPdfPath || null,
+        downloadUrl: result.downloadUrl || null,
+        reportBucket: result.reportBucket || null,
+        reportFileName: result.reportFileName || null,
+        reportGcsUri: result.reportGcsUri || null,
+        signedReportUrl: result.signedReportUrl || null,
+        drivePdfUrl: result.drivePdfUrl || null,
         videoFile: result.videoFile || null,
         metadata: result.metadata || null
       },
@@ -739,4 +866,5 @@ app.listen(PORT, () => {
   console.log('GET /health registered');
   console.log('POST /analyze-gcs registered');
   console.log('POST /analyze-drive registered');
+  console.log('GET /jobs/:jobId/report registered');
 });
