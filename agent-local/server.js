@@ -57,6 +57,11 @@ const RECORDING_GRACE_SECONDS = Number(process.env.RECORDING_GRACE_SECONDS || 30
 const FORCE_KILL_GRACE_SECONDS = Number(process.env.FORCE_KILL_GRACE_SECONDS || 15);
 const FILE_PROGRESS_INTERVAL_MS = Number(process.env.FILE_PROGRESS_INTERVAL_MS || 60000);
 const NO_OUTPUT_TIMEOUT_MS = Number(process.env.NO_OUTPUT_TIMEOUT_MS || 35000);
+const JOB_POLL_INTERVAL_MS = Number(process.env.JOB_POLL_INTERVAL_MS || 30000);
+const JOB_POLL_TIMEOUT_MS = Number(process.env.JOB_POLL_TIMEOUT_MS || 90 * 60 * 1000);
+const REPORTS_DIR = process.env.REPORTS_DIR || path.join(__dirname, 'reports');
+const REPORT_ERRORS_DIR = path.join(REPORTS_DIR, 'errors');
+const AUTO_OPEN_REPORT = String(process.env.AUTO_OPEN_REPORT || 'false').toLowerCase() === 'true';
 
 const MAX_FFMPEG_LOG_CHARS = 20000;
 const MAX_FFMPEG_STDERR_LINES = 80;
@@ -193,6 +198,325 @@ function resolveDebugAnalyzePayload(body = {}, fallback = {}) {
   };
 }
 
+function safeFileName(input) {
+  return String(input || 'relatorio')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'relatorio';
+}
+
+function ensureDirSync(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function buildReportLocalPath({ recordingId, jobId, metadata = {}, remoteReportName = null }) {
+  const datePart = safeFileName(metadata.data || metadata.date || new Date().toISOString().slice(0, 10));
+  const salaPart = safeFileName(metadata.sala || metadata.room || 'sem_sala');
+  const horarioPart = safeFileName(metadata.horario || metadata.horarioAgendado || 'sem_horario');
+  const professorPart = safeFileName(metadata.professor || 'sem_professor');
+  const remoteName = remoteReportName ? path.basename(remoteReportName, path.extname(remoteReportName)) : null;
+  const baseName = remoteName || `${datePart}_${salaPart}_${horarioPart}_${professorPart}`;
+  const folder = safeFileName(jobId || recordingId || 'job');
+  const fileName = `${baseName}_job-${safeFileName(jobId || recordingId || 'job')}.pdf`;
+  const dir = path.join(REPORTS_DIR, folder);
+  const outputPath = path.join(dir, fileName);
+  return { dir, fileName, outputPath };
+}
+
+async function downloadReportPdf(downloadUrl, outputPath) {
+  const response = await fetch(downloadUrl);
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Falha ao baixar relatório: HTTP ${response.status} ${String(text || '').slice(0, 500)}`);
+  }
+
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  if (contentType && !contentType.includes('application/pdf') && !contentType.includes('application/octet-stream')) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Tipo de conteúdo inesperado ao baixar relatório: ${contentType}; body=${String(text || '').slice(0, 500)}`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length < 1000) {
+    throw new Error(`Relatório baixado parece inválido ou vazio. bytes=${buffer.length}`);
+  }
+
+  ensureDirSync(path.dirname(outputPath));
+  fs.writeFileSync(outputPath, buffer);
+  return { outputPath, bytes: buffer.length };
+}
+
+function saveReportControlJson({ pdfPath, jobId, recordingId, status, reportUrl, reportGcsUri, videoGcsUri, metadata = {}, error = null }) {
+  const baseDir = status === 'failed' ? REPORT_ERRORS_DIR : path.dirname(pdfPath);
+  ensureDirSync(baseDir);
+  const target = status === 'failed'
+    ? path.join(baseDir, `${safeFileName(jobId || recordingId || 'job')}.json`)
+    : `${pdfPath}.json`;
+  const payload = {
+    recordingId: recordingId || null,
+    jobId: jobId || null,
+    status: status || null,
+    pdfPath: pdfPath || null,
+    downloadedAt: new Date().toISOString(),
+    reportGcsUri: reportGcsUri || null,
+    videoGcsUri: videoGcsUri || null,
+    reportUrl: reportUrl || null,
+    metadata,
+    error: error ? {
+      message: error.message || String(error),
+      stage: error.stage || null,
+      stack: error.stack || null
+    } : null
+  };
+  fs.writeFileSync(target, JSON.stringify(payload, null, 2));
+  return target;
+}
+
+function walkFilesRecursive(rootDir, predicate = null) {
+  const files = [];
+  if (!fs.existsSync(rootDir)) return files;
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const currentDir = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (_error) {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!predicate || predicate(fullPath, entry)) files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function readRecentReportsFromDisk() {
+  const reportJsonFiles = walkFilesRecursive(REPORTS_DIR, (fullPath) => fullPath.endsWith('.pdf.json') && !fullPath.includes(`${path.sep}errors${path.sep}`));
+  const items = [];
+  for (const jsonPath of reportJsonFiles) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      if (!parsed || parsed.status !== 'success') continue;
+      const pdfPath = String(parsed.pdfPath || '').trim();
+      if (!pdfPath) continue;
+      items.push({
+        recordingId: parsed.recordingId || null,
+        jobId: parsed.jobId || null,
+        status: parsed.status || null,
+        pdfPath,
+        downloadedAt: parsed.downloadedAt || null,
+        reportGcsUri: parsed.reportGcsUri || null,
+        videoGcsUri: parsed.videoGcsUri || null,
+        reportUrl: parsed.reportUrl || null,
+        metadata: parsed.metadata || {}
+      });
+    } catch (_error) {
+      // ignora arquivo corrompido
+    }
+  }
+  return items.sort((a, b) => String(b.downloadedAt || '').localeCompare(String(a.downloadedAt || '')));
+}
+
+function findReportByJobId(jobId) {
+  if (!jobId) return null;
+  return readRecentReportsFromDisk().find((item) => item.jobId === jobId) || null;
+}
+
+function openReportPdfLocal(pdfPath) {
+  if (process.platform === 'win32') {
+    execFile('cmd', ['/c', 'start', '', pdfPath]);
+    return true;
+  }
+  if (process.platform === 'darwin') {
+    execFile('open', [pdfPath]);
+    return true;
+  }
+  execFile('xdg-open', [pdfPath]);
+  return true;
+}
+
+async function openReportPdf(pdfPath) {
+  if (process.platform === 'win32') {
+    execFile('cmd', ['/c', 'start', '', pdfPath]);
+    return true;
+  }
+  if (process.platform === 'darwin') {
+    execFile('open', [pdfPath]);
+    return true;
+  }
+  execFile('xdg-open', [pdfPath]);
+  return true;
+}
+
+async function pollAnalysisJobAndDownloadReport({ recordingId, jobId, statusUrl, metadata = {} }) {
+  const pollKey = String(jobId || recordingId || '');
+  if (!pollKey) return;
+  if (activeReportPolls.has(pollKey)) return activeReportPolls.get(pollKey);
+
+  const pollPromise = (async () => {
+    const startedAt = Date.now();
+    const deadline = startedAt + JOB_POLL_TIMEOUT_MS;
+    const statusEndpoint = new URL(statusUrl || `/jobs/${jobId}`, RAILWAY_API_URL).toString();
+    console.log(`[processing:${recordingId}] analysis_job_poll_started jobId=${jobId}`);
+
+    while (Date.now() <= deadline) {
+      let jobResponse;
+      let jobJson;
+      try {
+        jobResponse = await fetch(statusEndpoint, { headers: { 'Content-Type': 'application/json' } });
+        if (!jobResponse.ok) {
+          const text = await jobResponse.text().catch(() => '');
+          throw new Error(`Falha ao consultar job: HTTP ${jobResponse.status} ${String(text || '').slice(0, 500)}`);
+        }
+        jobJson = await jobResponse.json();
+      } catch (error) {
+        console.error(`[processing:${recordingId}] analysis_job_status jobId=${jobId} status=error stage=job_poll message=${error.message}`);
+        await new Promise((resolve) => setTimeout(resolve, JOB_POLL_INTERVAL_MS));
+        continue;
+      }
+
+      console.log(`[processing:${recordingId}] analysis_job_status jobId=${jobId} status=${jobJson?.status || null} stage=${jobJson?.stage || null}`);
+
+      if (jobJson?.status === 'failed') {
+        const jobError = jobJson.error || {};
+        const errorMessage = jobError.message || 'Job de análise falhou.';
+        console.error(`[processing:${recordingId}] analysis_job_failed jobId=${jobId} stage=${jobJson?.stage || null} message=${errorMessage}`);
+        const errorPath = saveReportControlJson({
+          pdfPath: null,
+          jobId,
+          recordingId,
+          status: 'failed',
+          reportUrl: null,
+          reportGcsUri: jobJson?.result?.reportGcsUri || null,
+          videoGcsUri: metadata.videoGcsUri || null,
+          metadata,
+          error: {
+            message: errorMessage,
+            stage: jobJson?.stage || null,
+            stack: jobError.stack || null
+          }
+        });
+        const rec = recordings.get(recordingId);
+        if (rec) {
+          rec.status = 'failed';
+          rec.failedStage = 'analysis_job_failed';
+          rec.error = errorMessage;
+          rec.errorDetails = { stage: 'analysis_job_failed', message: errorMessage, stack: jobError.stack || null, jobId };
+        }
+        setProcessingStatus(recordingId, {
+          status: 'failed',
+          failedStage: 'analysis_job_failed',
+          errorMessage,
+          errorStack: jobError.stack || null
+        });
+        return { ok: false, status: 'failed', errorPath, job: jobJson };
+      }
+
+      if (jobJson?.status === 'success') {
+        const reportUrlCandidate = jobJson?.result?.signedReportUrl || jobJson?.result?.downloadUrl || jobJson?.result?.reportUrl || null;
+        if (!reportUrlCandidate) {
+          throw new Error('Job concluído sem URL de download do relatório.');
+        }
+
+        const downloadUrl = reportUrlCandidate.startsWith('/')
+          ? new URL(reportUrlCandidate, RAILWAY_API_URL).toString()
+          : reportUrlCandidate;
+
+        const reportName = jobJson?.result?.reportFileName || path.basename(new URL(downloadUrl).pathname || 'relatorio.pdf');
+        const localPathInfo = buildReportLocalPath({
+          recordingId,
+          jobId,
+          metadata,
+          remoteReportName: reportName
+        });
+
+        console.log(`[processing:${recordingId}] report_download_started url=${downloadUrl}`);
+        const downloaded = await downloadReportPdf(downloadUrl, localPathInfo.outputPath);
+        const controlJsonPath = saveReportControlJson({
+          pdfPath: downloaded.outputPath,
+          jobId,
+          recordingId,
+          status: 'success',
+          reportUrl: downloadUrl,
+          reportGcsUri: jobJson?.result?.reportGcsUri || null,
+          videoGcsUri: metadata.videoGcsUri || null,
+          metadata
+        });
+        if (AUTO_OPEN_REPORT) {
+          try { await openReportPdf(downloaded.outputPath); } catch (error) { console.error(`[processing:${recordingId}] auto_open_report_failed jobId=${jobId} message=${error.message}`); }
+        }
+        if (metadata?.recordingId) {
+          updateRecentUploadJob(metadata.recordingId, {
+            jobId,
+            statusUrl: statusEndpoint,
+            reportPath: downloaded.outputPath,
+            reportJsonPath: controlJsonPath,
+            reportDownloadedAt: new Date().toISOString()
+          });
+        }
+        const rec = recordings.get(recordingId);
+        if (rec) {
+          rec.status = 'completed';
+          rec.reportUrl = downloaded.outputPath;
+          rec.localPdfPath = downloaded.outputPath;
+          rec.reportDownloadedAt = new Date().toISOString();
+          rec.reportControlJsonPath = controlJsonPath;
+        }
+        setProcessingStatus(recordingId, {
+          status: 'completed',
+          failedStage: null,
+          errorMessage: null,
+          errorStack: null
+        });
+        console.log(`[processing:${recordingId}] report_download_success path=${downloaded.outputPath}`);
+        return { ok: true, status: 'success', outputPath: downloaded.outputPath, controlJsonPath, job: jobJson };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, JOB_POLL_INTERVAL_MS));
+    }
+
+    console.error(`[processing:${recordingId}] analysis_job_timeout jobId=${jobId}`);
+    const timeoutJsonPath = saveReportControlJson({
+      pdfPath: null,
+      jobId,
+      recordingId,
+      status: 'failed',
+      reportUrl: null,
+      reportGcsUri: null,
+      videoGcsUri: metadata.videoGcsUri || null,
+      metadata,
+      error: { message: `Timeout aguardando job ${jobId}` , stage: 'job_timeout' }
+    });
+    const rec = recordings.get(recordingId);
+    if (rec) {
+      rec.status = 'failed';
+      rec.failedStage = 'job_timeout';
+      rec.error = `Timeout aguardando job ${jobId}`;
+      rec.errorDetails = { stage: 'job_timeout', message: `Timeout aguardando job ${jobId}`, jobId };
+    }
+    setProcessingStatus(recordingId, {
+      status: 'failed',
+      failedStage: 'job_timeout',
+      errorMessage: `Timeout aguardando job ${jobId}`,
+      errorStack: null
+    });
+    return { ok: false, status: 'timeout', timeoutJsonPath };
+  })().finally(() => {
+    activeReportPolls.delete(pollKey);
+  });
+
+  activeReportPolls.set(pollKey, pollPromise);
+  return pollPromise;
+}
+
 async function requestAnalyzeGcs(payload, recordingId = 'debug') {
   if (!RAILWAY_API_URL) throw new Error('RAILWAY_API_URL nao configurada.');
   const RAILWAY_TIMEOUT_MS = 60 * 60 * 1000;
@@ -242,6 +566,8 @@ async function requestAnalyzeGcs(payload, recordingId = 'debug') {
 }
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 fs.mkdirSync(PROCESSED_JOBS_DIR, { recursive: true });
+fs.mkdirSync(REPORTS_DIR, { recursive: true });
+fs.mkdirSync(REPORT_ERRORS_DIR, { recursive: true });
 
 const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY };
 const recordings = new Map();
@@ -250,6 +576,7 @@ const activeRecordings = new Map();
 const processingQueue = [];
 const processingStatuses = new Map();
 const recentUploadJobs = [];
+const activeReportPolls = new Map();
 loadRecentUploadJobsFromDisk();
 let processingQueueRunning = false;
 const ACTIVE_RECORDING_STATUSES = new Set(['recording', 'stopping']);
@@ -607,6 +934,34 @@ async function finalizeRecording(recordingId) {
         console.log(`[processing:${recordingId}] analysis_request_accepted jobId=${payload.jobId}`);
         console.log(`[processing:${recordingId}] Acompanhe em ${payload.statusUrl || `/jobs/${payload.jobId}`}`);
         updateRecentUploadJob(rec.recordingId, { jobId: payload.jobId, statusUrl: payload.statusUrl || `/jobs/${payload.jobId}` });
+        const pollMetadata = {
+          recordingId: rec.recordingId,
+          localPath: rec.outputPath || null,
+          bucketName: rec.gcsBucket || null,
+          fileName: rec.gcsFileName || null,
+          videoGcsUri: rec.videoUrl || null,
+          professor: rec.professor || '',
+          turma: rec.turma || '',
+          nivel: rec.nivel || '',
+          sala: rec.sala || '',
+          durationMinutes: rec.durationSeconds ? Math.max(1, Math.round(rec.durationSeconds / 60)) : null,
+          statusUrl: payload.statusUrl || `/jobs/${payload.jobId}`
+        };
+        void pollAnalysisJobAndDownloadReport({
+          recordingId: rec.recordingId,
+          jobId: payload.jobId,
+          statusUrl: payload.statusUrl || `/jobs/${payload.jobId}`,
+          metadata: pollMetadata
+        }).then((result) => {
+          if (result?.ok === true && result?.outputPath) {
+            rec.reportUrl = result.outputPath;
+            rec.localPdfPath = result.outputPath;
+            rec.reportDownloadedAt = new Date().toISOString();
+            rec.reportDownloadResult = result;
+          }
+        }).catch((error) => {
+          console.error(`[processing:${recordingId}] report_poll_failed jobId=${payload.jobId} message=${error.message}`);
+        });
       }
       rec.report = payload;
       rec.localJsonPath = payload.localJsonPath || null;
@@ -1529,6 +1884,44 @@ app.post('/debug/reprocess-gcs', async (req, res) => {
       endpoint: error.endpoint || null,
       status: error.status || null,
       responseText: error.responseText || null
+    });
+  }
+});
+
+app.get('/debug/recent-reports', (_req, res) => {
+  return res.json({
+    ok: true,
+    reports: readRecentReportsFromDisk()
+  });
+});
+
+app.get('/debug/open-report/:jobId', async (req, res) => {
+  const report = findReportByJobId(req.params.jobId);
+  if (!report) {
+    return res.status(404).json({
+      ok: false,
+      message: 'Relatório não encontrado para este jobId.'
+    });
+  }
+  if (!report.pdfPath || !fs.existsSync(report.pdfPath)) {
+    return res.status(404).json({
+      ok: false,
+      message: 'Arquivo PDF local não encontrado.',
+      pdfPath: report.pdfPath || null
+    });
+  }
+  try {
+    openReportPdfLocal(report.pdfPath);
+    return res.json({
+      ok: true,
+      opened: true,
+      pdfPath: report.pdfPath
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      message: error.message,
+      pdfPath: report.pdfPath
     });
   }
 });
