@@ -40,6 +40,8 @@ const app = express();
 const RAILWAY_API_URL = String(process.env.RAILWAY_API_URL || '').replace(/\/$/, '');
 const PORT = Number(process.env.PORT || 4000);
 const RECORDINGS_DIR = path.join(__dirname, 'recordings');
+const PROCESSED_JOBS_DIR = path.join(__dirname, 'processed-jobs');
+const PROCESSED_JOBS_INDEX_PATH = path.join(PROCESSED_JOBS_DIR, 'recent-uploads.jsonl');
 const SCHEDULE_PATH = path.join(__dirname, '..', 'config', 'class-schedule.json');
 const MIN_LONG_RTSP_FILE_SIZE_BYTES = 1024 * 1024;
 const FFPROBE_FALLBACK_MIN_BYTES = 100 * 1024;
@@ -102,7 +104,144 @@ function redactSecrets(text) {
     .replace(/rtsp:\/\/[^@\s]+@/gi, 'rtsp://[REDACTED]@')
     .replace(/(password|pass|token|key)=([^&\s]+)/gi, '$1=[REDACTED]');
 }
+
+function appendRecentUploadJob(job) {
+  const entry = {
+    recordingId: job.recordingId || null,
+    localPath: job.localPath || null,
+    bucketName: job.bucketName || null,
+    fileName: job.fileName || null,
+    gcsUri: job.gcsUri || null,
+    professor: job.professor || null,
+    turma: job.turma || null,
+    durationMinutes: job.durationMinutes || null,
+    jobId: job.jobId || null,
+    statusUrl: job.statusUrl || null,
+    createdAt: job.createdAt || new Date().toISOString(),
+    updatedAt: job.updatedAt || new Date().toISOString()
+  };
+  recentUploadJobs.unshift(entry);
+  while (recentUploadJobs.length > 20) recentUploadJobs.pop();
+  try {
+    fs.appendFileSync(PROCESSED_JOBS_INDEX_PATH, `${JSON.stringify(entry)}\n`);
+  } catch (error) {
+    console.error(`[processed-jobs] falha ao registrar upload: ${error.message}`);
+  }
+  try {
+    fs.writeFileSync(path.join(PROCESSED_JOBS_DIR, `${entry.recordingId || `upload_${Date.now()}`}.json`), JSON.stringify(entry, null, 2));
+  } catch (error) {
+    console.error(`[processed-jobs] falha ao salvar json do upload: ${error.message}`);
+  }
+  return entry;
+}
+
+function getRecentUploadJobs() {
+  return recentUploadJobs.slice(0, 20);
+}
+
+function loadRecentUploadJobsFromDisk() {
+  try {
+    if (!fs.existsSync(PROCESSED_JOBS_INDEX_PATH)) return;
+    const lines = fs.readFileSync(PROCESSED_JOBS_INDEX_PATH, 'utf8')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const entries = [];
+    for (const line of lines.slice(-20)) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry && typeof entry === 'object') entries.push(entry);
+      } catch (_error) {
+        // ignora linha inválida
+      }
+    }
+    recentUploadJobs.splice(0, recentUploadJobs.length, ...entries.reverse());
+  } catch (error) {
+    console.error(`[processed-jobs] falha ao carregar uploads recentes: ${error.message}`);
+  }
+}
+
+function updateRecentUploadJob(recordingId, patch) {
+  const index = recentUploadJobs.findIndex((item) => item.recordingId === recordingId);
+  if (index === -1) return null;
+  const next = { ...recentUploadJobs[index], ...patch, updatedAt: new Date().toISOString() };
+  recentUploadJobs[index] = next;
+  try {
+    fs.writeFileSync(path.join(PROCESSED_JOBS_DIR, `${recordingId}.json`), JSON.stringify(next, null, 2));
+  } catch (error) {
+    console.error(`[processed-jobs] falha ao atualizar json do upload: ${error.message}`);
+  }
+  return next;
+}
+
+function resolveDebugAnalyzePayload(body = {}, fallback = {}) {
+  const bucketName = String(body.bucketName || body.bucket || body.gcsBucket || fallback.bucketName || '').trim();
+  const fileName = String(body.fileName || body.gcsPath || body.objectName || body.destination || body.gcsFileName || body.storagePath || fallback.fileName || '').trim();
+  return {
+    bucketName,
+    fileName,
+    gcsUri: String(body.gcsUri || body.gcsURI || body.gsUri || fallback.gcsUri || `gs://${bucketName}/${fileName}`).trim(),
+    professor: body.professor || fallback.professor || '',
+    turma: body.turma || fallback.turma || '',
+    nivel: body.nivel || fallback.nivel || '',
+    sala: body.sala || fallback.sala || '',
+    durationMinutes: body.durationMinutes || fallback.durationMinutes || null,
+    prompt: body.prompt || fallback.prompt || '',
+    cameraId: body.cameraId || fallback.cameraId || '',
+    recordingStartedAt: body.recordingStartedAt || fallback.recordingStartedAt || '',
+    recordingEndedAt: body.recordingEndedAt || fallback.recordingEndedAt || ''
+  };
+}
+
+async function requestAnalyzeGcs(payload, recordingId = 'debug') {
+  if (!RAILWAY_API_URL) throw new Error('RAILWAY_API_URL nao configurada.');
+  const RAILWAY_TIMEOUT_MS = 60 * 60 * 1000;
+  const analysisEndpoint = `${RAILWAY_API_URL}/analyze-gcs`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(new Error('Railway excedeu timeout de 60 minutos.')), RAILWAY_TIMEOUT_MS);
+  try {
+    const bodyJson = JSON.stringify(payload);
+    const response = await fetch(analysisEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: bodyJson
+    });
+    const contentType = response.headers.get('content-type') || '';
+    const responseText = await response.text();
+    if (!contentType.toLowerCase().includes('application/json')) {
+      const error = new Error(`Railway retornou resposta nao JSON em ${analysisEndpoint}: status=${response.status} content-type=${contentType || 'desconhecido'}`);
+      error.status = response.status;
+      error.responseText = String(responseText || '').slice(0, 1000);
+      error.endpoint = analysisEndpoint;
+      throw error;
+    }
+    let parsed;
+    try {
+      parsed = responseText ? JSON.parse(responseText) : {};
+    } catch (error) {
+      error.responseText = responseText;
+      error.status = response.status;
+      error.endpoint = analysisEndpoint;
+      throw error;
+    }
+    if (!response.ok) {
+      const railwayError = new Error(parsed.error || parsed.message || 'Falha ao analisar no Railway');
+      railwayError.status = response.status;
+      railwayError.responseText = responseText;
+      railwayError.endpoint = analysisEndpoint;
+      throw railwayError;
+    }
+    return { response, payload: parsed, analysisEndpoint };
+  } catch (error) {
+    console.error(`[processing:${recordingId}] analysis_request_failed`);
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+fs.mkdirSync(PROCESSED_JOBS_DIR, { recursive: true });
 
 const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY };
 const recordings = new Map();
@@ -110,6 +249,8 @@ const recordingQueues = new Map();
 const activeRecordings = new Map();
 const processingQueue = [];
 const processingStatuses = new Map();
+const recentUploadJobs = [];
+loadRecentUploadJobsFromDisk();
 let processingQueueRunning = false;
 const ACTIVE_RECORDING_STATUSES = new Set(['recording', 'stopping']);
 const dailyScheduleState = {
@@ -350,10 +491,23 @@ async function finalizeRecording(recordingId) {
       console.log(`[processing:${recordingId}] Iniciando upload GCS`);
       const gcsUpload = await withTimeout(uploadVideoToGCS(rec.outputPath, rec), UPLOAD_TIMEOUT_MS, 'Upload GCS');
       rec.gcsBucket = pickFirstNonEmpty(gcsUpload.bucketName, gcsUpload.bucket, gcsUpload.gcsBucket);
-      rec.gcsFileName = pickFirstNonEmpty(gcsUpload.fileName, gcsUpload.gcsPath, gcsUpload.gcsFileName, gcsUpload.objectName, gcsUpload.destination, gcsUpload.storagePath);
-      rec.videoUrl = gcsUpload.videoUrl;
+      rec.gcsFileName = pickFirstNonEmpty(gcsUpload.fileName, gcsUpload.gcsFileName, gcsUpload.gcsPath, gcsUpload.objectName, gcsUpload.destination, gcsUpload.storagePath);
+      rec.videoUrl = pickFirstNonEmpty(gcsUpload.gcsUri, gcsUpload.videoUrl, `gs://${rec.gcsBucket}/${rec.gcsFileName}`);
       rec.gcsPublicUrl = gcsUpload.publicUrl;
       rec.uploadedAt = new Date().toISOString();
+      console.log(`[processing:${recordingId}] gcs_upload_result bucketName=${rec.gcsBucket || null} fileName=${rec.gcsFileName || null} gcsUri=${rec.videoUrl || null}`);
+      appendRecentUploadJob({
+        recordingId: rec.recordingId,
+        localPath: rec.outputPath,
+        bucketName: rec.gcsBucket,
+        fileName: rec.gcsFileName,
+        gcsUri: rec.videoUrl,
+        professor: rec.professor,
+        turma: rec.turma,
+        durationMinutes: rec.durationSeconds ? Math.max(1, Math.round(rec.durationSeconds / 60)) : null,
+        createdAt: rec.uploadedAt,
+        updatedAt: rec.uploadedAt
+      });
       setProcessingStatus(recordingId, { status: 'uploaded', failedStage: null, errorMessage: null, errorStack: null });
       console.log(`[processing:${recordingId}] upload_success`);
       console.log(`[processing:${recordingId}] Upload GCS concluÃ­do`);
@@ -366,10 +520,10 @@ async function finalizeRecording(recordingId) {
     rec.status = 'calling_railway';
     notifyRecordingStatus(rec, rec.status);
     let payload;
+    let analysisAccepted = false;
     try {
       setProcessingStatus(recordingId, { status: 'analyzing', failedStage: null, errorMessage: null, errorStack: null });
       if (!RAILWAY_API_URL) throw new Error('RAILWAY_API_URL nÃ£o configurada.');
-      console.log(`[processing:${recordingId}] ${payload.accepted ? 'Analise aceita em background' : 'Analise concluida'}`);
       console.log(`[processing:${recordingId}] Chamando Railway`);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(new Error('Railway excedeu timeout de 60 minutos.')), RAILWAY_TIMEOUT_MS);
@@ -449,8 +603,10 @@ async function finalizeRecording(recordingId) {
         throw railwayError;
       }
       if (payload && payload.accepted === true && payload.jobId) {
+        analysisAccepted = true;
         console.log(`[processing:${recordingId}] analysis_request_accepted jobId=${payload.jobId}`);
         console.log(`[processing:${recordingId}] Acompanhe em ${payload.statusUrl || `/jobs/${payload.jobId}`}`);
+        updateRecentUploadJob(rec.recordingId, { jobId: payload.jobId, statusUrl: payload.statusUrl || `/jobs/${payload.jobId}` });
       }
       rec.report = payload;
       rec.localJsonPath = payload.localJsonPath || null;
@@ -459,9 +615,9 @@ async function finalizeRecording(recordingId) {
       rec.analysisJobId = payload.jobId || null;
       rec.analysisStatusUrl = payload.statusUrl || null;
       rec.remoteJsonUrl = payload.jsonUrl || null;
-      console.log(`[processing:${recordingId}] ${payload.accepted ? 'Analise aceita em background' : 'Analise concluida'}`);
+      console.log(`[processing:${recordingId}] ${analysisAccepted ? 'Analise aceita em background' : 'Analise concluida'}`);
     } catch (error) {
-      console.log(`[processing:${recordingId}] ${payload.accepted ? 'Analise aceita em background' : 'Analise concluida'}`);
+      console.log(`[processing:${recordingId}] ${analysisAccepted ? 'Analise aceita em background' : 'Analise concluida'}`);
       logProcessingError(recordingId, currentStage, error);
       throw error;
     }
@@ -1295,6 +1451,86 @@ app.get('/processing-status/:recordingId', (req, res) => {
     reportUrl: rec?.reportUrl || null,
     jsonUrl: rec?.jsonUrl || rec?.remoteJsonUrl || null
   });
+});
+
+app.get('/debug/recent-uploads', (_req, res) => {
+  return res.json({
+    ok: true,
+    uploads: getRecentUploadJobs()
+  });
+});
+
+app.post('/debug/reprocess-last', async (_req, res) => {
+  const lastUpload = getRecentUploadJobs()[0];
+  if (!lastUpload) {
+    return res.status(404).json({
+      ok: false,
+      message: 'Nenhum upload recente encontrado.'
+    });
+  }
+
+  const payload = resolveDebugAnalyzePayload({}, lastUpload);
+  if (!payload.bucketName || !payload.fileName) {
+    return res.status(400).json({
+      ok: false,
+      message: 'Upload recente sem bucketName/fileName válidos.',
+      upload: lastUpload
+    });
+  }
+
+  try {
+    const result = await requestAnalyzeGcs(payload, lastUpload.recordingId || 'debug');
+    if (result?.payload?.accepted === true && result?.payload?.jobId) {
+      updateRecentUploadJob(lastUpload.recordingId, {
+        jobId: result.payload.jobId,
+        statusUrl: result.payload.statusUrl || `/jobs/${result.payload.jobId}`
+      });
+    }
+    return res.status(202).json({
+      ok: true,
+      accepted: Boolean(result?.payload?.accepted),
+      jobId: result?.payload?.jobId || null,
+      statusUrl: result?.payload?.statusUrl || (result?.payload?.jobId ? `/jobs/${result.payload.jobId}` : null),
+      payload: result?.payload || null
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      ok: false,
+      message: error.message,
+      endpoint: error.endpoint || null,
+      status: error.status || null,
+      responseText: error.responseText || null
+    });
+  }
+});
+
+app.post('/debug/reprocess-gcs', async (req, res) => {
+  const payload = resolveDebugAnalyzePayload(req.body || {});
+  if (!payload.bucketName || !payload.fileName) {
+    return res.status(400).json({
+      ok: false,
+      message: 'bucketName/fileName sao obrigatorios.'
+    });
+  }
+
+  try {
+    const result = await requestAnalyzeGcs(payload, payload.recordingId || 'debug');
+    return res.status(202).json({
+      ok: true,
+      accepted: Boolean(result?.payload?.accepted),
+      jobId: result?.payload?.jobId || null,
+      statusUrl: result?.payload?.statusUrl || (result?.payload?.jobId ? `/jobs/${result.payload.jobId}` : null),
+      payload: result?.payload || null
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      ok: false,
+      message: error.message,
+      endpoint: error.endpoint || null,
+      status: error.status || null,
+      responseText: error.responseText || null
+    });
+  }
 });
 
 app.listen(PORT, () => console.log(`Agent local rodando na porta ${PORT}`));

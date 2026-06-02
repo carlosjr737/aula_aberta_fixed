@@ -545,7 +545,34 @@ async function runAnalyzeGcs(payload, jobId = null) {
     if (jobId) console.log(`[job:${jobId}] download_gcs_started`);
     videoPath = path.join(os.tmpdir(), `gcs_video_${Date.now()}_${path.basename(gcsFileName) || 'video.mp4'}`);
     logStage(recordingId, 'gcs_download_started', { endpoint, gcsBucket, gcsFileName, localPath: videoPath });
-    await downloadFromGCS(gcsBucket, gcsFileName, videoPath).catch((error) => { throw withFailedStage(error, 'gcs_download'); });
+    try {
+      await downloadFromGCS(gcsBucket, gcsFileName, videoPath);
+    } catch (error) {
+      const errorMessage = String(error?.message || '');
+      const missingObject = /No such object/i.test(errorMessage) || /not found/i.test(errorMessage) || error?.status === 404 || error?.code === 404;
+      if (missingObject) {
+        const notFoundError = new Error('Arquivo não encontrado no GCS');
+        notFoundError.failedStage = 'gcs_download';
+        notFoundError.status = 404;
+        notFoundError.details = {
+          endpoint,
+          bucketName: gcsBucket,
+          fileName: gcsFileName,
+          localPath: videoPath,
+          suggestion: 'Verifique o fileName exato gerado no upload_success',
+          originalMessage: errorMessage,
+          originalStack: error?.stack || null
+        };
+        logStageError(recordingId, 'gcs_download_failed', notFoundError, {
+          endpoint,
+          localPath: videoPath,
+          gcsBucket,
+          gcsFileName
+        });
+        throw notFoundError;
+      }
+      throw withFailedStage(error, 'gcs_download');
+    }
     logStage(recordingId, 'gcs_download_success', { localPath: videoPath, fileSize: fs.statSync(videoPath).size });
     if (jobId) console.log(`[job:${jobId}] download_gcs_success`);
 
