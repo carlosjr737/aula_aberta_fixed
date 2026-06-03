@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const os = require('os');
@@ -9,7 +9,7 @@ const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL } = require('./services/geminiAnalyzer');
-const { DNA_PROFESSOR_DK_FULL_OPERATIONAL } = require('./prompts/dnaProfessorDKFullOperational');
+const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT } = require('./prompts/dnaProfessorDKFullOperational');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
 let ffprobeStaticPath = 'ffprobe';
@@ -27,20 +27,6 @@ const DEFAULT_PROMPT = 'Observar principalmente autonomia, refinamento e respons
 const ANALYSIS_ROUTES = ['/analyze-drive', '/analyze-gcs'];
 const jobs = new Map();
 
-const REQUIRED_PILLARS = [
-  'Clareza de Objetivo e Direção Pedagógica',
-  'Estrutura e Progressão Didática',
-  'Gestão de Tempo e Ritmo',
-  'Comunicação e Comandos',
-  'Demonstração Técnica e Referência Corporal',
-  'Correção Técnica e Refinamento',
-  'Leitura de Turma e Adaptação',
-  'Autonomia dos Alunos',
-  'Gestão de Energia e Presença de Liderança',
-  'Responsabilidade de Elenco e Ambiente de Aprendizagem',
-  'Musicalidade, Precisão e Coerência Artística',
-  'Evolução Observável ao Longo da Aula'
-];
 
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '50mb' }));
@@ -55,7 +41,7 @@ process.on('unhandledRejection', (reason) => {
 
 function parseServiceAccountJson() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON nÃ£o configurado.');
+  if (!raw) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON nÃƒÂ£o configurado.');
   const credentials = JSON.parse(String(raw).trim());
   if (credentials.private_key) credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
   return credentials;
@@ -177,11 +163,11 @@ async function uploadPdfToGCS(filePath, { bucketName, objectName }) {
     gcsUri: `gs://${data.bucket || bucket}/${data.name || objectName}`
   };
 }
-async function downloadFromUrl(url, destPath) { const response = await fetch(url); if (!response.ok) throw new Error(`Falha ao baixar vídeo URL: ${response.status}`); await pipeline(response.body, fs.createWriteStream(destPath)); }
+async function downloadFromUrl(url, destPath) { const response = await fetch(url); if (!response.ok) throw new Error(`Falha ao baixar vÃ­deo URL: ${response.status}`); await pipeline(response.body, fs.createWriteStream(destPath)); }
 async function validateVideoFileLegacy(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) return { valid: false, fileSize: 0, error: 'Arquivo não encontrado.' };
+  if (!filePath || !fs.existsSync(filePath)) return { valid: false, fileSize: 0, error: 'Arquivo nÃ£o encontrado.' };
   const fileSize = fs.statSync(filePath).size;
-  if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo inválido (${fileSize} bytes).` };
+  if (fileSize < MIN_VALIDATION_FILE_SIZE_BYTES) return { valid: false, fileSize, error: `Arquivo invÃ¡lido (${fileSize} bytes).` };
 
   try {
     const { stdout, stderr } = await execFileAsync(FFPROBE_PATH, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', filePath]);
@@ -189,7 +175,7 @@ async function validateVideoFileLegacy(filePath) {
     const probe = JSON.parse(stdout || '{}');
     const streams = Array.isArray(probe.streams) ? probe.streams : [];
     const videoStream = streams.find((stream) => stream.codec_type === 'video');
-    if (!videoStream) return { valid: false, fileSize, error: 'Arquivo inválido: stream de vídeo não encontrada.' };
+    if (!videoStream) return { valid: false, fileSize, error: 'Arquivo invÃ¡lido: stream de vÃ­deo nÃ£o encontrada.' };
     const audioStream = streams.find((stream) => stream.codec_type === 'audio');
     const durationRaw = probe?.format?.duration || videoStream.duration || 0;
     const duration = Number(durationRaw) || 0;
@@ -208,7 +194,7 @@ async function validateVideoFileLegacy(filePath) {
         warning: 'ffprobe falhou no backend, mas arquivo tem tamanho suficiente para continuar.'
       };
     }
-    return { valid: false, fileSize, error: 'Falha ao validar vídeo com ffprobe.' };
+    return { valid: false, fileSize, error: 'Falha ao validar vÃ­deo com ffprobe.' };
   }
 }
 async function validateVideoFile(filePath) {
@@ -337,11 +323,11 @@ function buildClassContext(input = {}, scheduleFallback = {}) {
 }
 
 function validatePromptHasFullDNA(finalPrompt = '') {
-  const missing = REQUIRED_PILLARS.filter((pillar) => !finalPrompt.includes(pillar));
+  const missing = PEDK_DNA_PILLARS.filter((pillar) => !finalPrompt.includes(pillar.code) && !finalPrompt.includes(pillar.name) && !finalPrompt.includes(pillar.fullName));
   if (missing.length) {
     const error = new Error('Prompt inválido: DNA Professor DK incompleto.');
     error.statusCode = 400;
-    error.missingPillars = missing;
+    error.missingPillars = missing.map((pillar) => pillar.code);
     throw error;
   }
 }
@@ -349,7 +335,7 @@ function validatePromptHasFullDNA(finalPrompt = '') {
 function buildAnalysisPrompt({ classContext, userNotes = '' }) {
   const notes = normalizeField(userNotes, DEFAULT_PROMPT);
   return [
-    DNA_PROFESSOR_DK_FULL_OPERATIONAL.trim(),
+    PEDK_DNA_PROMPT.trim(),
     '',
     'CONTEXTO DA AULA:',
     `- Professor: ${classContext.professor || 'Não informado'}`,
@@ -367,13 +353,13 @@ function buildAnalysisPrompt({ classContext, userNotes = '' }) {
     'OBSERVAÇÕES ESPECÍFICAS:',
     notes,
     '',
-    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 12 pilares e a estrutura obrigatória definida no DNA.'
+    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 12 pilares oficiais do PEDK e a estrutura obrigatória definida no DNA.'
   ].join('\n');
 }
 
 function detectNoClass(rawResponse = '') {
   const text = String(rawResponse || '').toLowerCase();
-  const signs = ['sala vazia', 'não há professor', 'nao ha professor', 'não há alunos', 'nao ha alunos', 'não foi possível avaliar', 'nao foi possivel avaliar'];
+  const signs = ['sala vazia', 'nÃ£o hÃ¡ professor', 'nao ha professor', 'nÃ£o hÃ¡ alunos', 'nao ha alunos', 'nÃ£o foi possÃ­vel avaliar', 'nao foi possivel avaliar'];
   return signs.some((sign) => text.includes(sign));
 }
 
@@ -397,7 +383,7 @@ async function segmentVideo(videoPath, segmentSeconds = 600) {
     .filter((name) => name.startsWith(path.basename(segmentPrefix)) && name.endsWith('.mp4'))
     .map((name) => path.join(os.tmpdir(), name))
     .sort();
-  if (!files.length) throw new Error('Falha ao segmentar vídeo em blocos temporais.');
+  if (!files.length) throw new Error('Falha ao segmentar vÃ­deo em blocos temporais.');
   return files;
 }
 
@@ -436,14 +422,14 @@ app.get('/jobs/:jobId/report', async (req, res) => {
   if (!job) {
     return res.status(404).json({
       ok: false,
-      message: 'Job não encontrado'
+      message: 'Job nÃ£o encontrado'
     });
   }
 
   if (job.status !== 'success') {
     return res.status(400).json({
       ok: false,
-      message: 'Relatório ainda não está disponível',
+      message: 'RelatÃ³rio ainda nÃ£o estÃ¡ disponÃ­vel',
       status: job.status,
       stage: job.stage,
       error: job.error || null
@@ -466,10 +452,10 @@ app.get('/jobs/:jobId/report', async (req, res) => {
   if (!bucketName || !objectName) {
     return res.status(404).json({
       ok: false,
-      message: 'Arquivo PDF não encontrado no servidor',
+      message: 'Arquivo PDF nÃ£o encontrado no servidor',
       reportPath,
       reportGcsUri,
-      suggestion: 'O arquivo pode ter sido perdido após restart/deploy. Use upload para GCS como armazenamento definitivo.'
+      suggestion: 'O arquivo pode ter sido perdido apÃ³s restart/deploy. Use upload para GCS como armazenamento definitivo.'
     });
   }
 
@@ -481,7 +467,7 @@ app.get('/jobs/:jobId/report', async (req, res) => {
     if (!res.headersSent) {
       return res.status(500).json({
         ok: false,
-        message: 'Falha ao baixar relatório do GCS',
+        message: 'Falha ao baixar relatÃ³rio do GCS',
         reportGcsUri,
         bucketName,
         fileName: objectName,
@@ -515,12 +501,12 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
   let segmentCount = 0;
 
   if (tokenCount <= TOKEN_SINGLE_ANALYSIS_LIMIT) {
-    console.log(`[analysis:${recordingId}] estratégia=inteiro`);
+    console.log(`[analysis:${recordingId}] estratÃ©gia=inteiro`);
     console.log(`[analysis:${recordingId}] analysis_strategy=direct_gemini ffmpeg_required=false`);
     rawResponse = await analyzeVideo(active.uri, finalPrompt, metadata).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
   } else {
     strategy = 'segmented';
-    console.log(`[analysis:${recordingId}] estratégia=segmentado`);
+    console.log(`[analysis:${recordingId}] estratÃ©gia=segmentado`);
     console.log(`[analysis:${recordingId}] analysis_strategy=compressed_video ffmpeg_required=true`);
     const segments = await segmentVideo(videoPath, 600);
     segmentCount = segments.length;
@@ -528,35 +514,72 @@ async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput
     const partialAnalyses = [];
     for (let index = 0; index < segments.length; index += 1) {
       const segmentPath = segments[index];
-      console.log(`[analysis:${recordingId}] início análise parcial segmento ${index + 1}/${segmentCount}`);
+      console.log(`[analysis:${recordingId}] inÃ­cio anÃ¡lise parcial segmento ${index + 1}/${segmentCount}`);
       const segmentUpload = await uploadToGemini(segmentPath, 'video/mp4').catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
       const segmentActive = await waitForGeminiActive(segmentUpload.name).catch((error) => { throw withFailedStage(error, 'gemini_upload'); });
       const partialPrompt = `${finalPrompt}
 
-ANÁLISE PARCIAL DE BLOCO TEMPORAL:
-- Este é o bloco ${index + 1} de ${segmentCount}.
-- Responda apenas com análise parcial deste bloco.
-- Inclua horários aproximados dentro deste bloco (ex.: minuto 02:30), evidências observáveis e notas parciais por pilares quando aplicável.
-- Não conclua o relatório final ainda.`;
+ANÃLISE PARCIAL DE BLOCO TEMPORAL:
+- Este Ã© o bloco ${index + 1} de ${segmentCount}.
+- Responda apenas com anÃ¡lise parcial deste bloco.
+- Inclua horÃ¡rios aproximados dentro deste bloco (ex.: minuto 02:30), evidÃªncias observÃ¡veis e notas parciais por pilares quando aplicÃ¡vel.
+- NÃ£o conclua o relatÃ³rio final ainda.`;
       const partialText = await analyzeVideo(segmentActive.uri, partialPrompt, { ...metadata, segmentIndex: index + 1, segmentCount }).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
       partialAnalyses.push(`BLOCO ${index + 1}/${segmentCount}:\n${partialText}`);
-      console.log(`[analysis:${recordingId}] fim análise parcial segmento ${index + 1}/${segmentCount}`);
+      console.log(`[analysis:${recordingId}] fim anÃ¡lise parcial segmento ${index + 1}/${segmentCount}`);
       if (fs.existsSync(segmentPath)) fs.unlinkSync(segmentPath);
     }
-    console.log(`[analysis:${recordingId}] início consolidação final`);
+    console.log(`[analysis:${recordingId}] inÃ­cio consolidaÃ§Ã£o final`);
     const consolidationPrompt = `${finalPrompt}
 
-CONSOLIDE AS ANÁLISES PARCIAIS ABAIXO EM UM RELATÓRIO FINAL COMPLETO COM OS 12 PILARES DO DNA PROFESSOR DK.
-Mantenha evidências observáveis, progressão temporal, síntese executiva e plano de evolução.
+CONSOLIDE AS ANÃLISES PARCIAIS ABAIXO EM UM RELATÃ“RIO FINAL COMPLETO COM OS 12 PILARES DO DNA PROFESSOR DK.
+Mantenha evidÃªncias observÃ¡veis, progressÃ£o temporal, sÃ­ntese executiva e plano de evoluÃ§Ã£o.
 
 ${partialAnalyses.join('\n\n')}`;
     rawResponse = await analyzeText(consolidationPrompt).catch((error) => { throw withFailedStage(error, 'gemini_analysis'); });
-    console.log(`[analysis:${recordingId}] fim consolidação final`);
+    console.log(`[analysis:${recordingId}] fim consolidaÃ§Ã£o final`);
   }
   const noClassDetected = detectNoClass(rawResponse);
   const status = noClassDetected ? 'completed_no_class_detected' : 'completed';
 
-  const reportPayload = { recordingId, professor: classContext.professor, turma: classContext.turma, nivel: classContext.nivel, sala: classContext.sala, startedAt: recordingStartedAt || 'Não informado', endedAt: recordingEndedAt || 'Não informado', durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado', prompt, analysis: rawResponse };
+  console.log('[pedk] dna_matrix_version=pedk_dna_v1');
+  console.log(`[pedk] expected_pillars=${PEDK_DNA_PILLARS.length}`);
+  console.log('[pedk] structured_analysis_started');
+
+  const structuredAnalysisPrompt = buildStructuredAnalysisPrompt({
+    classContext,
+    rawResponse,
+    userNotes: prompt
+  });
+  const structuredAnalysisText = await analyzeText(structuredAnalysisPrompt).catch((error) => { throw withFailedStage(error, 'structured_analysis'); });
+  let structuredAnalysis;
+  try {
+    structuredAnalysis = validateStructuredPedkAnalysis(JSON.parse(extractJsonObject(structuredAnalysisText)));
+  } catch (error) {
+    error.failedStage = error.failedStage || 'structured_analysis';
+    error.details = {
+      ...(error.details || {}),
+      responseText: structuredAnalysisText
+    };
+    throw error;
+  }
+  console.log('[pedk] structured_analysis_validated');
+
+  const reportPayload = {
+    recordingId,
+    professor: classContext.professor,
+    classContext,
+    turma: classContext.turma,
+    nivel: classContext.nivel,
+    sala: classContext.sala,
+    startedAt: recordingStartedAt || 'Não informado',
+    endedAt: recordingEndedAt || 'Não informado',
+    durationMinutes: recordingStartedAt && recordingEndedAt ? Math.max(1, Math.round((new Date(recordingEndedAt) - new Date(recordingStartedAt)) / 60000)) : 'Não informado',
+    prompt,
+    analysis: rawResponse,
+    structuredAnalysis,
+    dnaMatrixVersion: PEDK_DNA_MATRIX_VERSION
+  };
 
   reportPayload.sourceFileName = sourceFileName;
 
@@ -614,8 +637,8 @@ ${partialAnalyses.join('\n\n')}`;
     driveJsonUrl: null,
     metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
     video: { fileName: sourceFileName || recordingId, sourceUrl: sourceUrl || null, sourceUrlExpiresAt: sourceUrlExpiresAt || null, validation: videoValidation || null },
-    prompt: { dnaVersion: '1.0', promptTemplateVersion: '2.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
-    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, status, tokenCount, strategy, segmentCount }
+    prompt: { dnaVersion: PEDK_DNA_MATRIX_VERSION, promptTemplateVersion: '3.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
+    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, structuredAnalysis, status, tokenCount, strategy, segmentCount, matrixVersion: PEDK_DNA_MATRIX_VERSION }
   };
   if (drivePdfUrl) responsePayload.drivePdfUrl = drivePdfUrl;
   if (reportDownloadUrl) responsePayload.downloadUrl = reportDownloadUrl;
@@ -627,12 +650,12 @@ app.post('/disabled-url-analysis', async (req, res) => {
   let videoPath = null;
   try {
     const { videoUrl, fileName = '', professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
-    if (!videoUrl) return res.status(400).json({ error: 'videoUrl é obrigatório.' });
+    if (!videoUrl) return res.status(400).json({ error: 'videoUrl Ã© obrigatÃ³rio.' });
     videoPath = path.join(os.tmpdir(), `url_video_${Date.now()}.mp4`);
     await downloadFromUrl(videoUrl, videoPath);
     const videoValidation = await validateVideoFile(videoPath);
     if (!videoValidation.valid) {
-      return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
+      return res.status(400).json({ error: videoValidation.error || 'Arquivo invÃ¡lido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
     }
     const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: fileName || `url_${Date.now()}`, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName: fileName, sourceUrl: videoUrl, videoValidation });
     return res.json(analysis);
@@ -672,7 +695,7 @@ async function runAnalyzeGcs(payload, jobId = null) {
       const errorMessage = String(error?.message || '');
       const missingObject = /No such object/i.test(errorMessage) || /not found/i.test(errorMessage) || error?.status === 404 || error?.code === 404;
       if (missingObject) {
-        const notFoundError = new Error('Arquivo não encontrado no GCS');
+        const notFoundError = new Error('Arquivo nÃ£o encontrado no GCS');
         notFoundError.failedStage = 'gcs_download';
         notFoundError.status = 404;
         notFoundError.details = {
@@ -849,11 +872,11 @@ app.post('/analyze-drive', async (req, res) => {
   try {
     const { driveUrl, driveFileId, fileId, professor = '', modalidade = '', turma = '', faixaEtaria = '', nivel = '', sala = '', horario = '', duracao = '', observacoes = '', prompt = DEFAULT_PROMPT, cameraId = '', recordingStartedAt = '', recordingEndedAt = '' } = req.body || {};
     const finalFileId = extractDriveFileId(driveFileId || fileId || driveUrl || '');
-    if (!finalFileId) return res.status(400).json({ error: 'É necessário enviar driveFileId, fileId ou driveUrl válidos.' });
+    if (!finalFileId) return res.status(400).json({ error: 'Ã‰ necessÃ¡rio enviar driveFileId, fileId ou driveUrl vÃ¡lidos.' });
     videoPath = path.join(os.tmpdir(), `drive_video_${Date.now()}_${finalFileId}.mp4`);
     await downloadFromDrive(finalFileId, videoPath);
     const videoValidation = await validateVideoFile(videoPath);
-    if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo inválido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
+    if (!videoValidation.valid) return res.status(400).json({ error: videoValidation.error || 'Arquivo invÃ¡lido', failedStage: 'validating_video_backend', fileSize: videoValidation.fileSize || 0, videoValidation });
     const analysis = await analyzeFromLocalVideo({ videoPath, recordingId: finalFileId, classContextInput: { professor, modalidade, turma, faixaEtaria, nivel, sala, horarioAgendado: horario, durationMinutes: duracao, observacoes }, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName: finalFileId, videoValidation });
     return res.json(analysis);
   } catch (error) { return res.status(error.statusCode || 500).json({ error: error.message, missingPillars: error.missingPillars || [] }); }
@@ -868,3 +891,4 @@ app.listen(PORT, () => {
   console.log('POST /analyze-drive registered');
   console.log('GET /jobs/:jobId/report registered');
 });
+

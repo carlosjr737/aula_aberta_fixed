@@ -1,137 +1,204 @@
-const DNA_PROFESSOR_DK_FULL_OPERATIONAL = `DNA PROFESSOR DK — MATRIZ OPERACIONAL COMPLETA (v1.0)
+const PEDK_DNA_MATRIX_VERSION = 'pedk_dna_v1';
 
-ESSÊNCIA DO PROFESSOR DK
-Professor DK é condução pedagógica com rigor técnico, clareza de comando, progressão didática e responsabilidade artística. A aula deve gerar aprendizagem observável, evolução do grupo e segurança de execução.
+const PEDK_DNA_PILLARS = [
+  {
+    order: 1,
+    code: 'presenca_autoridade',
+    name: 'Presença e autoridade',
+    fullName: 'Presença docente e autoridade pelo exemplo',
+    weight: 9,
+    question: 'O professor conduz pelo exemplo?',
+    definition: 'Professor ocupa sala com exemplo e comando.',
+    grade1: 'Professor ausente ou dependente de bronca.',
+    grade3: 'Conduz com clareza básica.',
+    grade5: 'Referência visível de foco e energia.'
+  },
+  {
+    order: 2,
+    code: 'demonstracao_qualificada',
+    name: 'Demonstração qualificada',
+    fullName: 'Clareza corporal e demonstração qualificada',
+    weight: 10,
+    question: 'O corpo do professor ensina forma, ritmo e intenção?',
+    definition: 'Mostra corpo, ritmo, direção, intenção e acabamento.',
+    grade1: 'Demonstra pouco ou de forma confusa.',
+    grade3: 'Demonstra caminho adequado.',
+    grade5: 'Demonstra como régua artística.'
+  },
+  {
+    order: 3,
+    code: 'organizacao_espacial',
+    name: 'Organização espacial',
+    fullName: 'Organização espacial e desenho de sala',
+    weight: 9,
+    question: 'A sala está organizada e produtiva?',
+    definition: 'Desenha sala, grupos, linhas, entradas e esperas.',
+    grade1: 'Turma perdida.',
+    grade3: 'Espaço funcional.',
+    grade5: 'Sala opera como ensaio.'
+  },
+  {
+    order: 4,
+    code: 'progressao_fluxo',
+    name: 'Progressão e fluxo',
+    fullName: 'Progressão pedagógica e ritmo de aula',
+    weight: 8,
+    question: 'A aula progride sem pausas vazias?',
+    definition: 'Aula em blocos com transições claras.',
+    grade1: 'Aula travada ou caótica.',
+    grade3: 'Fluxo básico.',
+    grade5: 'Alto tempo útil e progressão visível.'
+  },
+  {
+    order: 5,
+    code: 'correcao_impacto',
+    name: 'Correção com impacto',
+    fullName: 'Correção com impacto',
+    weight: 11,
+    question: 'As correções geram melhora visível?',
+    definition: 'Intervenção gera melhora na tentativa seguinte.',
+    grade1: 'Não corrige ou corrige de modo vago.',
+    grade3: 'Corrige pontos principais.',
+    grade5: 'Correções precisas e transformadoras.'
+  },
+  {
+    order: 6,
+    code: 'repeticao_produtiva',
+    name: 'Repetição produtiva',
+    fullName: 'Repetição produtiva e refinamento',
+    weight: 7,
+    question: 'Cada repetição tem objetivo claro?',
+    definition: 'Repetir para limpar, musicalizar e refinar.',
+    grade1: 'Repetição automática.',
+    grade3: 'Repetições ajudam memorização.',
+    grade5: 'Cada rodada tem ganho claro.'
+  },
+  {
+    order: 7,
+    code: 'musicalidade',
+    name: 'Musicalidade',
+    fullName: 'Musicalidade e intenção artística',
+    weight: 10,
+    question: 'A música vira corpo, não só contagem?',
+    definition: 'Música como corpo, acento, pausa e intenção.',
+    grade1: 'Só contagem ou fundo.',
+    grade3: 'Tempo e intenção básicos.',
+    grade5: 'Aluno dança musicalmente.'
+  },
+  {
+    order: 8,
+    code: 'performance_palco',
+    name: 'Performance e palco',
+    fullName: 'Cultura de performance e palco',
+    weight: 10,
+    question: 'A aula treina presença e palco?',
+    definition: 'Aula regular treina comportamento cênico.',
+    grade1: 'Só passos.',
+    grade3: 'Momentos de apresentação.',
+    grade5: 'Cultura de palco integrada.'
+  },
+  {
+    order: 9,
+    code: 'seguranca_emocional',
+    name: 'Segurança emocional',
+    fullName: 'Autoridade positiva, vínculo e segurança emocional',
+    weight: 8,
+    question: 'A cobrança acontece com respeito?',
+    definition: 'Cobrança com respeito, vínculo e firmeza.',
+    grade1: 'Tensão ou permissividade.',
+    grade3: 'Ambiente seguro básico.',
+    grade5: 'Alta exigência com confiança.'
+  },
+  {
+    order: 10,
+    code: 'adaptacao_contexto',
+    name: 'Adaptação ao contexto',
+    fullName: 'Adaptação por idade, nível e objetivo da turma',
+    weight: 8,
+    question: 'A estratégia combina com idade e nível?',
+    definition: 'Ajusta linguagem por idade, nível e objetivo.',
+    grade1: 'Modelo único para todos.',
+    grade3: 'Adapta o suficiente.',
+    grade5: 'DNA mantido com método ajustado.'
+  },
+  {
+    order: 11,
+    code: 'observacao_elenco',
+    name: 'Observação e elenco',
+    fullName: 'Observação ativa, autonomia e cultura de elenco',
+    weight: 5,
+    question: 'Quem observa aprende e fica pronto para entrar?',
+    definition: 'Observadores aprendem; turma assume autonomia.',
+    grade1: 'Espera passiva.',
+    grade3: 'Alternância funcional.',
+    grade5: 'Cultura de elenco ativa.'
+  },
+  {
+    order: 12,
+    code: 'diagnostico_individualizacao',
+    name: 'Diagnóstico e individualização',
+    fullName: 'Diagnóstico pedagógico e individualização',
+    weight: 5,
+    question: 'Há leitura coletiva e individual da turma?',
+    definition: 'Lê coletivo e indivíduo com evidências.',
+    grade1: 'Sem leitura visível.',
+    grade3: 'Identifica padrões principais.',
+    grade5: 'Diagnóstico fino e específico.'
+  }
+];
 
-O QUE O PROFESSOR DK NÃO É
-- Não é performance egoica do professor.
-- Não é intensidade sem método.
-- Não é correção genérica sem alvo técnico.
-- Não é elogio vazio, sem evidência.
-- Não é crítica vaga, sem evidência.
+function buildPedkMatrixPromptBlock() {
+  return PEDK_DNA_PILLARS.map((pillar) => [
+    `${pillar.order}. ${pillar.code}`,
+    `Nome: ${pillar.name}`,
+    `Peso: ${pillar.weight}`,
+    `Pergunta resumida: ${pillar.question}`,
+    `Definição: ${pillar.definition}`,
+    `Nível 1: ${pillar.grade1}`,
+    `Nível 3: ${pillar.grade3}`,
+    `Nível 5: ${pillar.grade5}`
+  ].join('\n')).join('\n\n');
+}
 
-PRINCÍPIOS INEGOCIÁVEIS
-1. Separar comportamento observável de interpretação.
-2. Não elogiar sem evidência observável.
-3. Não criticar sem evidência observável.
-4. Quando algo não puder ser verificado por câmera/áudio, registrar: “não confirmado por limitação técnica”.
-5. Julgar a aula inteira por critérios consistentes e comparáveis.
+const PEDK_DNA_PROMPT = [
+  'PEDK - Projeto de Excelência DK',
+  `DNA Professor DK - Versão 1.0 (${PEDK_DNA_MATRIX_VERSION})`,
+  '',
+  'Use somente os 12 pilares oficiais abaixo, nesta ordem, com estes pesos. Não crie, renomeie ou substitua pilares.',
+  '',
+  buildPedkMatrixPromptBlock(),
+  '',
+  'Regras de avaliação:',
+  '- A nota de cada pilar deve ser de 1 a 5.',
+  '- Nota 3 significa adequado e funcional.',
+  '- Nota 5 é rara e reservada para comportamento que poderia servir como referência de formação interna.',
+  '- Toda nota precisa ter evidência observável.',
+  '- Separe comportamento observável de interpretação pedagógica.',
+  '- Quando câmera ou áudio limitarem a análise, registre a limitação antes de concluir.',
+  '- Não transforme limitação técnica em falha do professor sem evidência.',
+  '- Não copiar estilo de Ruan, Gladson ou Marcella. A matriz padroniza qualidade, não personalidade.',
+  '',
+  'Estrutura obrigatória do relatório:',
+  '1. Identificação da aula',
+  '2. Limitações da análise',
+  '3. Síntese objetiva',
+  '4. Evidências observáveis por momento da aula',
+  '5. Avaliação pelos 12 pilares oficiais do PEDK',
+  '6. Tabela ponderada',
+  '7. Classificação final',
+  '8. Forças principais',
+  '9. Pontos de atenção',
+  '10. Plano de evolução',
+  '11. Parecer final',
+  '',
+  'A pontuação ponderada deve seguir: weightedScore = score * weight.',
+  'A nota final deve seguir: finalScore = soma(weightedScore) / 100.',
+  'Use apenas os 12 pilares oficiais do PEDK como matriz principal da avaliação.'
+].join('\n');
 
-CRITÉRIOS DE NOTA (1 A 5)
-1 = Crítico/insuficiente: padrão abaixo do mínimo, compromete aprendizagem.
-2 = Frágil: há intenção, mas execução irregular ou incompleta.
-3 = Adequado: atende o básico com consistência mínima.
-4 = Forte: acima da média, com boa consistência.
-5 = Excelência: alto nível técnico-pedagógico, consistente e replicável.
-
-12 PILARES AVALIATIVOS (DEFINIÇÃO, EVIDÊNCIAS, EXCELÊNCIA, ALERTA)
-1) Clareza de Objetivo e Direção Pedagógica
-Definição: A aula comunica propósito, foco técnico e resultado esperado.
-Evidências esperadas: enunciado de objetivo, checkpoints de progresso, fechamento alinhado ao objetivo.
-Sinais de excelência: objetivo explícito no início e retomado durante a aula.
-Sinais de alerta: aula sem norte claro ou mudanças de foco sem justificativa.
-
-2) Estrutura e Progressão Didática
-Definição: Sequência lógica de aquecimento, desenvolvimento e consolidação.
-Evidências esperadas: progressão de complexidade, transições coerentes.
-Sinais de excelência: cada etapa prepara a seguinte com intencionalidade.
-Sinais de alerta: saltos bruscos, repetições improdutivas, perda de tempo.
-
-3) Gestão de Tempo e Ritmo
-Definição: Uso eficiente do tempo para maximizar prática e aprendizagem.
-Evidências esperadas: blocos com duração adequada, ritmo sustentado.
-Sinais de excelência: equilíbrio entre explicação, prática e correção.
-Sinais de alerta: longas pausas, aceleração descontrolada ou lentidão crônica.
-
-4) Comunicação e Comandos
-Definição: Linguagem clara, objetiva, acionável e audível.
-Evidências esperadas: instruções curtas, comandos com verbos de ação, confirmações de entendimento.
-Sinais de excelência: comandos precisos e consistentes com a tarefa.
-Sinais de alerta: comandos ambíguos, contraditórios ou inaudíveis.
-
-5) Demonstração Técnica e Referência Corporal
-Definição: Qualidade da demonstração e referência física oferecida à turma.
-Evidências esperadas: demonstrações visíveis, marcações de forma e execução.
-Sinais de excelência: modelagem corporal clara com ajuste de detalhes-chave.
-Sinais de alerta: ausência de referência técnica observável.
-
-6) Correção Técnica e Refinamento
-Definição: Intervenções para ajustar execução e elevar qualidade.
-Evidências esperadas: correções específicas, individualizadas ou por grupo, com critério técnico.
-Sinais de excelência: correção precisa + nova tentativa + melhora observável.
-Sinais de alerta: correções genéricas, repetidas sem efeito.
-
-7) Leitura de Turma e Adaptação
-Definição: Capacidade de calibrar a aula ao nível real da turma.
-Evidências esperadas: ajustes de dificuldade, ritmo e abordagem conforme resposta dos alunos.
-Sinais de excelência: adaptação rápida sem perder objetivo.
-Sinais de alerta: insistência no plano ignorando sinais da turma.
-
-8) Autonomia dos Alunos
-Definição: Estímulo à execução consciente sem dependência contínua.
-Evidências esperadas: momentos de prática autônoma, checagem de retenção.
-Sinais de excelência: alunos executam com menos intervenção ao longo da aula.
-Sinais de alerta: dependência total de comando contínuo.
-
-9) Gestão de Energia e Presença de Liderança
-Definição: Condução com presença, foco e energia pedagógica adequada.
-Evidências esperadas: manutenção de engajamento, tom e postura de liderança.
-Sinais de excelência: energia sustenta a atenção sem gerar ruído.
-Sinais de alerta: energia caótica, dispersão ou apatia prolongada.
-
-10) Responsabilidade de Elenco e Ambiente de Aprendizagem
-Definição: Gestão do coletivo com respeito, disciplina e segurança.
-Evidências esperadas: organização do espaço, combinados de convivência, direcionamento do grupo.
-Sinais de excelência: ambiente produtivo, respeitoso e estável.
-Sinais de alerta: desorganização recorrente ou perda de controle do grupo.
-
-11) Musicalidade, Precisão e Coerência Artística
-Definição: Relação entre proposta técnica e resultado artístico/musical.
-Evidências esperadas: sincronia, dinâmica, intenção e limpeza de execução.
-Sinais de excelência: precisão com expressividade consistente.
-Sinais de alerta: execução desconectada da proposta artística.
-
-12) Evolução Observável ao Longo da Aula
-Definição: Evidência de melhora entre início, meio e fim.
-Evidências esperadas: redução de erros, ganho de precisão, maior autonomia.
-Sinais de excelência: progresso claro e sustentado em múltiplos momentos.
-Sinais de alerta: estagnação sem intervenção eficaz.
-
-PESOS DA MATRIZ (SOMA = 100)
-1. Clareza de Objetivo e Direção Pedagógica: 8
-2. Estrutura e Progressão Didática: 10
-3. Gestão de Tempo e Ritmo: 8
-4. Comunicação e Comandos: 10
-5. Demonstração Técnica e Referência Corporal: 8
-6. Correção Técnica e Refinamento: 12
-7. Leitura de Turma e Adaptação: 8
-8. Autonomia dos Alunos: 8
-9. Gestão de Energia e Presença de Liderança: 8
-10. Responsabilidade de Elenco e Ambiente de Aprendizagem: 8
-11. Musicalidade, Precisão e Coerência Artística: 10
-12. Evolução Observável ao Longo da Aula: 10
-
-ESTRUTURA OBRIGATÓRIA DO RELATÓRIO (SEMPRE NESTA ORDEM)
-1. Identificação da aula
-2. Limitações da análise
-3. Síntese objetiva
-4. Evidências por momento da aula
-5. Avaliação pelos 12 pilares
-6. Tabela ponderada
-7. Forças principais
-8. Pontos de atenção
-9. Plano de evolução
-10. Parecer final
-
-REGRA PARA VÍDEOS LONGOS
-- Não remover o DNA.
-- Dividir em blocos temporais.
-- Analisar cada bloco com este DNA completo.
-- Consolidar os blocos em relatório final usando este DNA completo.
-
-ORDEM METODOLÓGICA FINAL
-- Diferenciar fato observado e interpretação.
-- Toda conclusão deve apontar evidência observável.
-- Registrar explicitamente limitações técnicas quando necessário.`;
-
-module.exports = { DNA_PROFESSOR_DK_FULL_OPERATIONAL };
+module.exports = {
+  PEDK_DNA_MATRIX_VERSION,
+  PEDK_DNA_PILLARS,
+  PEDK_DNA_PROMPT,
+  buildPedkMatrixPromptBlock
+};
