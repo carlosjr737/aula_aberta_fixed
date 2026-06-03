@@ -196,9 +196,129 @@ const PEDK_DNA_PROMPT = [
   'Use apenas os 12 pilares oficiais do PEDK como matriz principal da avaliação.'
 ].join('\n');
 
+function buildAnalysisPrompt({ classContext, userNotes = '' } = {}) {
+  const notes = String(userNotes || '').trim() || 'Observar principalmente autonomia, refinamento e responsabilidade de elenco.';
+  return [
+    PEDK_DNA_PROMPT.trim(),
+    '',
+    'CONTEXTO DA AULA:',
+    `- Professor: ${classContext?.professor || 'Não informado'}`,
+    `- Modalidade: ${classContext?.modalidade || 'Não informado'}`,
+    `- Turma: ${classContext?.turma || 'Não informado'}`,
+    `- Faixa etária: ${classContext?.faixaEtaria || 'Não informado'}`,
+    `- Nível: ${classContext?.nivel || 'Não informado'}`,
+    `- Tipo de aula: ${classContext?.tipoAula || 'Não informado'}`,
+    `- Sala: ${classContext?.sala || 'Não informado'}`,
+    `- Câmera: ${classContext?.cameraId || 'Não informado'}`,
+    `- Data: ${classContext?.data || 'Não informado'}`,
+    `- Horário agendado: ${classContext?.horarioAgendado || 'Não informado'}`,
+    `- Duração (min): ${classContext?.durationMinutes || 'Não informado'}`,
+    '',
+    'OBSERVAÇÕES ESPECÍFICAS:',
+    notes,
+    '',
+    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 12 pilares oficiais do PEDK e a estrutura obrigatória definida no DNA.'
+  ].join('\n');
+}
+
+function buildStructuredAnalysisPrompt({
+  rawAnalysisText = '',
+  metadata = {},
+  pillars = PEDK_DNA_PILLARS,
+  classContext = {},
+  userNotes = ''
+} = {}) {
+  const normalizedPillars = Array.isArray(pillars) && pillars.length ? pillars : PEDK_DNA_PILLARS;
+  const normalizedMetadata = metadata || {};
+  const normalizedClassContext = classContext || normalizedMetadata.classContext || {};
+  const notes = String(userNotes || normalizedMetadata.userNotes || '').trim();
+
+  return [
+    'Você deve converter a análise abaixo em JSON estruturado e válido.',
+    'Retorne APENAS JSON, sem markdown, sem explicações e sem blocos de código.',
+    `schemaVersion: "${PEDK_DNA_MATRIX_VERSION}"`,
+    'analysisType: "class_video"',
+    '',
+    'MATRIZ OFICIAL DO PEDK:',
+    JSON.stringify(normalizedPillars.map((pillar) => ({
+      order: pillar.order,
+      code: pillar.code,
+      name: pillar.name,
+      weight: pillar.weight,
+      question: pillar.question,
+      definition: pillar.definition,
+      grade1: pillar.grade1,
+      grade3: pillar.grade3,
+      grade5: pillar.grade5
+    })), null, 2),
+    '',
+    'REGRAS OBRIGATÓRIAS:',
+    '- Use exatamente 12 pillarScores.',
+    '- Os códigos e pesos devem bater com a matriz oficial.',
+    '- score deve ficar entre 1 e 5.',
+    '- 3 = adequado/funcional.',
+    '- 5 deve ser raro e reservado para referência interna.',
+    '- weightedScore = score * weight.',
+    '- finalScore = soma(weightedScore) / 100.',
+    '- Toda nota precisa ter evidência observável.',
+    '- Separe comportamento observável de interpretação pedagógica.',
+    '- Se houver limitação de câmera ou áudio, registre em limitations.',
+    '- Não use a matriz antiga como pilares principais.',
+    '- Não copie estilo de Ruan, Gladson ou Marcella.',
+    '',
+    'ESTRUTURA JSON ESPERADA:',
+    JSON.stringify({
+      schemaVersion: PEDK_DNA_MATRIX_VERSION,
+      analysisType: 'class_video',
+      teacher: { name: normalizedClassContext.professor || normalizedMetadata.professor || '' },
+      class: {
+        name: normalizedClassContext.turma || normalizedMetadata.turma || '',
+        level: normalizedClassContext.nivel || normalizedMetadata.nivel || '',
+        modality: normalizedClassContext.modalidade || normalizedMetadata.modalidade || '',
+        room: normalizedClassContext.sala || normalizedMetadata.sala || '',
+        cameraId: normalizedClassContext.cameraId || normalizedMetadata.cameraId || '',
+        date: normalizedClassContext.data || normalizedMetadata.data || '',
+        scheduledTime: normalizedClassContext.horarioAgendado || normalizedMetadata.horarioAgendado || '',
+        durationMinutes: Number(normalizedClassContext.durationMinutes || normalizedMetadata.durationMinutes) || null
+      },
+      limitations: [{ type: 'audio', description: '...' }],
+      objectiveSummary: '...',
+      timelineEvidence: [{ start: '00:00', end: '00:30', description: '...', relatedPillars: ['presenca_autoridade'] }],
+      pillarScores: [{
+        order: 1,
+        code: 'presenca_autoridade',
+        name: 'Presença e autoridade',
+        weight: 9,
+        score: 3,
+        weightedScore: 27,
+        justification: '...',
+        evidence: ['...'],
+        impact: '...',
+        improvementAction: '...'
+      }],
+      finalScore: 3.56,
+      classification: 'Forte',
+      strengths: [{ title: '...', description: '...', relatedPillars: ['demonstracao_qualificada'] }],
+      attentionPoints: [{ title: '...', description: '...', observableBehavior: '...', impact: '...', relatedPillars: ['progressao_fluxo'] }],
+      evolutionPlan: [{ priority: 'alta', action: '...', expectedBehavior: '...', improvementIndicator: '...', timeframe: '2 a 4 semanas', relatedPillars: ['correcao_impacto'] }],
+      finalOpinion: '...'
+    }, null, 2),
+    '',
+    'DADOS DE APOIO PARA INFERÊNCIA:',
+    `METADATA: ${JSON.stringify(normalizedMetadata)}`,
+    `CONTEXT: ${JSON.stringify(normalizedClassContext)}`,
+    `OBSERVAÇÕES DO USUÁRIO: ${notes || 'Nenhuma'}`,
+    `ANÁLISE TEXTUAL PRELIMINAR: ${rawAnalysisText}`,
+    '',
+    'Retorne somente o JSON final coerente com a matriz oficial.'
+  ].join('\n');
+}
+
 module.exports = {
   PEDK_DNA_MATRIX_VERSION,
   PEDK_DNA_PILLARS,
   PEDK_DNA_PROMPT,
-  buildPedkMatrixPromptBlock
+  buildPedkMatrixPromptBlock,
+  buildAnalysisPrompt,
+  buildStructuredAnalysisPrompt
 };

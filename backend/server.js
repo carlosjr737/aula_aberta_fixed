@@ -9,7 +9,7 @@ const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL } = require('./services/geminiAnalyzer');
-const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT } = require('./prompts/dnaProfessorDKFullOperational');
+const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT, buildAnalysisPrompt, buildStructuredAnalysisPrompt } = require('./prompts/dnaProfessorDKFullOperational');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
 let ffprobeStaticPath = 'ffprobe';
@@ -330,31 +330,6 @@ function validatePromptHasFullDNA(finalPrompt = '') {
     error.missingPillars = missing.map((pillar) => pillar.code);
     throw error;
   }
-}
-
-function buildAnalysisPrompt({ classContext, userNotes = '' }) {
-  const notes = normalizeField(userNotes, DEFAULT_PROMPT);
-  return [
-    PEDK_DNA_PROMPT.trim(),
-    '',
-    'CONTEXTO DA AULA:',
-    `- Professor: ${classContext.professor || 'Não informado'}`,
-    `- Modalidade: ${classContext.modalidade || 'Não informado'}`,
-    `- Turma: ${classContext.turma || 'Não informado'}`,
-    `- Faixa etária: ${classContext.faixaEtaria || 'Não informado'}`,
-    `- Nível: ${classContext.nivel || 'Não informado'}`,
-    `- Tipo de aula: ${classContext.tipoAula || 'Não informado'}`,
-    `- Sala: ${classContext.sala || 'Não informado'}`,
-    `- Câmera: ${classContext.cameraId || 'Não informado'}`,
-    `- Data: ${classContext.data || 'Não informado'}`,
-    `- Horário agendado: ${classContext.horarioAgendado || 'Não informado'}`,
-    `- Duração (min): ${classContext.durationMinutes || 'Não informado'}`,
-    '',
-    'OBSERVAÇÕES ESPECÍFICAS:',
-    notes,
-    '',
-    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 12 pilares oficiais do PEDK e a estrutura obrigatória definida no DNA.'
-  ].join('\n');
 }
 
 function detectNoClass(rawResponse = '') {
