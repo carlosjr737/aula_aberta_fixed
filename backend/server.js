@@ -10,6 +10,7 @@ const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
 const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL } = require('./services/geminiAnalyzer');
 const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT, buildAnalysisPrompt, buildStructuredAnalysisPrompt } = require('./prompts/dnaProfessorDKFullOperational');
+const { validateStructuredPedkAnalysis } = require('./services/pedkValidation');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { uploadPdf } = require('./services/googleDriveUpload');
 let ffprobeStaticPath = 'ffprobe';
@@ -529,7 +530,9 @@ ${partialAnalyses.join('\n\n')}`;
   const structuredAnalysisText = await analyzeText(structuredAnalysisPrompt).catch((error) => { throw withFailedStage(error, 'structured_analysis'); });
   let structuredAnalysis;
   try {
-    structuredAnalysis = validateStructuredPedkAnalysis(JSON.parse(extractJsonObject(structuredAnalysisText)));
+    structuredAnalysis = JSON.parse(extractJsonObject(structuredAnalysisText));
+    const validationResult = validateStructuredPedkAnalysis(structuredAnalysis, PEDK_DNA_PILLARS);
+    console.log('[pedk] structured_analysis_validated', validationResult);
   } catch (error) {
     error.failedStage = error.failedStage || 'structured_analysis';
     error.details = {
@@ -538,7 +541,6 @@ ${partialAnalyses.join('\n\n')}`;
     };
     throw error;
   }
-  console.log('[pedk] structured_analysis_validated');
 
   const reportPayload = {
     recordingId,
@@ -866,4 +868,5 @@ app.listen(PORT, () => {
   console.log('POST /analyze-drive registered');
   console.log('GET /jobs/:jobId/report registered');
 });
+
 
