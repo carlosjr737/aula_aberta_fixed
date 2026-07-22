@@ -1,14 +1,16 @@
-﻿function validateStructuredPedkAnalysis(structuredAnalysis, pillars) {
+﻿const { PEDK_DNA_MATRIX_VERSION } = require('../prompts/dnaProfessorDKFullOperational');
+
+function validateStructuredPedkAnalysis(structuredAnalysis, pillars) {
   if (!structuredAnalysis || typeof structuredAnalysis !== 'object') {
     throw new Error('structuredAnalysis inválido ou vazio');
   }
 
-  if (structuredAnalysis.schemaVersion !== 'pedk_dna_v1') {
-    throw new Error(`schemaVersion inválido: ${structuredAnalysis.schemaVersion}`);
+  if (structuredAnalysis.schemaVersion !== PEDK_DNA_MATRIX_VERSION) {
+    throw new Error(`schemaVersion inválido: ${structuredAnalysis.schemaVersion} (esperado ${PEDK_DNA_MATRIX_VERSION})`);
   }
 
-  if (!Array.isArray(pillars) || pillars.length !== 12) {
-    throw new Error(`pillars precisa ter 12 itens, recebeu ${Array.isArray(pillars) ? pillars.length : 'inválido'}`);
+  if (!Array.isArray(pillars) || pillars.length === 0) {
+    throw new Error(`pillars precisa ser um array não vazio, recebeu ${Array.isArray(pillars) ? pillars.length : 'inválido'}`);
   }
 
   if (!Array.isArray(structuredAnalysis.pillarScores)) {
@@ -67,12 +69,12 @@
 
   const totalWeight = pillars.reduce((sum, pillar) => sum + Number(pillar.weight || 0), 0);
 
-  if (totalWeight !== 100) {
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
     throw new Error(`Soma dos pesos inválida: ${totalWeight}`);
   }
 
   const weightedSum = structuredAnalysis.pillarScores.reduce((sum, item) => sum + Number(item.weightedScore || 0), 0);
-  const expectedFinalScore = Number((weightedSum / 100).toFixed(2));
+  const expectedFinalScore = Number((weightedSum / totalWeight).toFixed(2));
   const receivedFinalScore = Number(structuredAnalysis.finalScore);
 
   if (!Number.isFinite(receivedFinalScore) || Math.abs(receivedFinalScore - expectedFinalScore) > 0.05) {

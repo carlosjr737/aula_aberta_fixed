@@ -1,4 +1,4 @@
-const PEDK_DNA_MATRIX_VERSION = 'pedk_dna_v1';
+const PEDK_DNA_MATRIX_VERSION = 'pedk_dna_v2';
 
 const PEDK_DNA_PILLARS = [
   {
@@ -6,7 +6,7 @@ const PEDK_DNA_PILLARS = [
     code: 'presenca_autoridade',
     name: 'Presença e autoridade',
     fullName: 'Presença docente e autoridade pelo exemplo',
-    weight: 9,
+    weight: 8,
     question: 'O professor conduz pelo exemplo?',
     definition: 'Professor ocupa sala com exemplo e comando.',
     grade1: 'Professor ausente ou dependente de bronca.',
@@ -18,7 +18,7 @@ const PEDK_DNA_PILLARS = [
     code: 'demonstracao_qualificada',
     name: 'Demonstração qualificada',
     fullName: 'Clareza corporal e demonstração qualificada',
-    weight: 10,
+    weight: 8,
     question: 'O corpo do professor ensina forma, ritmo e intenção?',
     definition: 'Mostra corpo, ritmo, direção, intenção e acabamento.',
     grade1: 'Demonstra pouco ou de forma confusa.',
@@ -30,7 +30,7 @@ const PEDK_DNA_PILLARS = [
     code: 'organizacao_espacial',
     name: 'Organização espacial',
     fullName: 'Organização espacial e desenho de sala',
-    weight: 9,
+    weight: 8,
     question: 'A sala está organizada e produtiva?',
     definition: 'Desenha sala, grupos, linhas, entradas e esperas.',
     grade1: 'Turma perdida.',
@@ -54,7 +54,7 @@ const PEDK_DNA_PILLARS = [
     code: 'correcao_impacto',
     name: 'Correção com impacto',
     fullName: 'Correção com impacto',
-    weight: 11,
+    weight: 8,
     question: 'As correções geram melhora visível?',
     definition: 'Intervenção gera melhora na tentativa seguinte.',
     grade1: 'Não corrige ou corrige de modo vago.',
@@ -66,7 +66,7 @@ const PEDK_DNA_PILLARS = [
     code: 'repeticao_produtiva',
     name: 'Repetição produtiva',
     fullName: 'Repetição produtiva e refinamento',
-    weight: 7,
+    weight: 8,
     question: 'Cada repetição tem objetivo claro?',
     definition: 'Repetir para limpar, musicalizar e refinar.',
     grade1: 'Repetição automática.',
@@ -78,7 +78,7 @@ const PEDK_DNA_PILLARS = [
     code: 'musicalidade',
     name: 'Musicalidade',
     fullName: 'Musicalidade e intenção artística',
-    weight: 10,
+    weight: 8,
     question: 'A música vira corpo, não só contagem?',
     definition: 'Música como corpo, acento, pausa e intenção.',
     grade1: 'Só contagem ou fundo.',
@@ -90,7 +90,7 @@ const PEDK_DNA_PILLARS = [
     code: 'performance_palco',
     name: 'Performance e palco',
     fullName: 'Cultura de performance e palco',
-    weight: 10,
+    weight: 8,
     question: 'A aula treina presença e palco?',
     definition: 'Aula regular treina comportamento cênico.',
     grade1: 'Só passos.',
@@ -126,7 +126,7 @@ const PEDK_DNA_PILLARS = [
     code: 'observacao_elenco',
     name: 'Observação e elenco',
     fullName: 'Observação ativa, autonomia e cultura de elenco',
-    weight: 5,
+    weight: 8,
     question: 'Quem observa aprende e fica pronto para entrar?',
     definition: 'Observadores aprendem; turma assume autonomia.',
     grade1: 'Espera passiva.',
@@ -138,14 +138,29 @@ const PEDK_DNA_PILLARS = [
     code: 'diagnostico_individualizacao',
     name: 'Diagnóstico e individualização',
     fullName: 'Diagnóstico pedagógico e individualização',
-    weight: 5,
+    weight: 8,
     question: 'Há leitura coletiva e individual da turma?',
     definition: 'Lê coletivo e indivíduo com evidências.',
     grade1: 'Sem leitura visível.',
     grade3: 'Identifica padrões principais.',
     grade5: 'Diagnóstico fino e específico.'
+  },
+  {
+    order: 13,
+    code: 'engajamento_divertido',
+    name: 'Engajamento e diversão',
+    fullName: 'Energia, leveza e engajamento divertido',
+    weight: 8,
+    question: 'A aula tem leveza e os alunos demonstram prazer em dançar?',
+    definition: 'Conduz com energia e leveza; alunos sorriem, riem e demonstram felicidade genuína ao longo da aula.',
+    grade1: 'Clima pesado ou apático; alunos sem prazer aparente.',
+    grade3: 'Ambiente agradável, com momentos de leveza.',
+    grade5: 'Alegria contagiante: alunos sorrindo e gargalhando enquanto dançam com entrega.'
   }
 ];
+
+
+const PEDK_DNA_WEIGHT_SUM = PEDK_DNA_PILLARS.reduce((sum, pillar) => sum + pillar.weight, 0);
 
 function buildPedkMatrixPromptBlock() {
   return PEDK_DNA_PILLARS.map((pillar) => [
@@ -164,7 +179,7 @@ const PEDK_DNA_PROMPT = [
   'PEDK - Projeto de Excelência DK',
   `DNA Professor DK - Versão 1.0 (${PEDK_DNA_MATRIX_VERSION})`,
   '',
-  'Use somente os 12 pilares oficiais abaixo, nesta ordem, com estes pesos. Não crie, renomeie ou substitua pilares.',
+  'Use somente os 13 pilares oficiais abaixo, nesta ordem, com estes pesos. Não crie, renomeie ou substitua pilares.',
   '',
   buildPedkMatrixPromptBlock(),
   '',
@@ -183,7 +198,7 @@ const PEDK_DNA_PROMPT = [
   '2. Limitações da análise',
   '3. Síntese objetiva',
   '4. Evidências observáveis por momento da aula',
-  '5. Avaliação pelos 12 pilares oficiais do PEDK',
+  '5. Avaliação pelos 13 pilares oficiais do PEDK',
   '6. Tabela ponderada',
   '7. Classificação final',
   '8. Forças principais',
@@ -192,8 +207,8 @@ const PEDK_DNA_PROMPT = [
   '11. Parecer final',
   '',
   'A pontuação ponderada deve seguir: weightedScore = score * weight.',
-  'A nota final deve seguir: finalScore = soma(weightedScore) / 100.',
-  'Use apenas os 12 pilares oficiais do PEDK como matriz principal da avaliação.'
+  'A nota final deve seguir: finalScore = soma(weightedScore) / soma(weights). Nesta versao a soma dos pesos e 104.',
+  'Use apenas os 13 pilares oficiais do PEDK como matriz principal da avaliação.'
 ].join('\n');
 
 function buildAnalysisPrompt({ classContext, userNotes = '' } = {}) {
@@ -217,7 +232,7 @@ function buildAnalysisPrompt({ classContext, userNotes = '' } = {}) {
     'OBSERVAÇÕES ESPECÍFICAS:',
     notes,
     '',
-    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 12 pilares oficiais do PEDK e a estrutura obrigatória definida no DNA.'
+    'ORDEM FINAL: responder obrigatoriamente no modelo completo de relatório com os 13 pilares oficiais do PEDK e a estrutura obrigatória definida no DNA.'
   ].join('\n');
 }
 
@@ -253,13 +268,13 @@ function buildStructuredAnalysisPrompt({
     })), null, 2),
     '',
     'REGRAS OBRIGATÓRIAS:',
-    '- Use exatamente 12 pillarScores.',
+    '- Use exatamente 13 pillarScores.',
     '- Os códigos e pesos devem bater com a matriz oficial.',
     '- score deve ficar entre 1 e 5.',
     '- 3 = adequado/funcional.',
     '- 5 deve ser raro e reservado para referência interna.',
     '- weightedScore = score * weight.',
-    '- finalScore = soma(weightedScore) / 100.',
+    '- finalScore = soma(weightedScore) / soma(weights) (nesta versao = 104).',
     '- Toda nota precisa ter evidência observável.',
     '- Separe comportamento observável de interpretação pedagógica.',
     '- Se houver limitação de câmera ou áudio, registre em limitations.',
@@ -288,9 +303,9 @@ function buildStructuredAnalysisPrompt({
         order: 1,
         code: 'presenca_autoridade',
         name: 'Presença e autoridade',
-        weight: 9,
+        weight: 8,
         score: 3,
-        weightedScore: 27,
+        weightedScore: 24,
         justification: '...',
         evidence: ['...'],
         impact: '...',
@@ -317,6 +332,7 @@ function buildStructuredAnalysisPrompt({
 module.exports = {
   PEDK_DNA_MATRIX_VERSION,
   PEDK_DNA_PILLARS,
+  PEDK_DNA_WEIGHT_SUM,
   PEDK_DNA_PROMPT,
   buildPedkMatrixPromptBlock,
   buildAnalysisPrompt,

@@ -99,7 +99,7 @@ function renderStructuredAnalysis(doc, payload, structured) {
   addSectionTitle(doc, '4. Evidências observáveis por momento da aula');
   addWrappedList(doc, structured.timelineEvidence, 'Sem evidências temporais registradas.');
 
-  addSectionTitle(doc, '5. Avaliação pelos 12 pilares oficiais do PEDK');
+  addSectionTitle(doc, `5. Avaliação pelos ${structured.pillarScores.length} pilares oficiais do PEDK`);
   structured.pillarScores.forEach((pillar) => {
     doc.font('Helvetica-Bold').text(`${pillar.order}. ${pillar.code} - ${pillar.name} (peso ${pillar.weight})`);
     doc.font('Helvetica').text(`Nota: ${pillar.score} | Ponderado: ${pillar.weightedScore}`);
