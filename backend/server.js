@@ -8,7 +8,7 @@ const { execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const { pipeline } = require('stream/promises');
 const { google } = require('googleapis');
-const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL } = require('./services/geminiAnalyzer');
+const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, analyzeJson, countVideoTokens, GEMINI_MODEL } = require('./services/geminiAnalyzer');
 const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT, buildAnalysisPrompt, buildStructuredAnalysisPrompt } = require('./prompts/dnaProfessorDKFullOperational');
 const { validateStructuredPedkAnalysis } = require('./services/pedkValidation');
 const { generateLessonPdf } = require('./services/pdfGenerator');
@@ -333,6 +333,18 @@ function validatePromptHasFullDNA(finalPrompt = '') {
   }
 }
 
+function extractJsonObject(text = '') {
+  const raw = String(text || '');
+  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenceMatch ? fenceMatch[1] : raw;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error('Nenhum objeto JSON encontrado na resposta do modelo.');
+  }
+  return candidate.slice(start, end + 1);
+}
+
 function detectNoClass(rawResponse = '') {
   const text = String(rawResponse || '').toLowerCase();
   const signs = ['sala vazia', 'nÃ£o hÃ¡ professor', 'nao ha professor', 'nÃ£o hÃ¡ alunos', 'nao ha alunos', 'nÃ£o foi possÃ­vel avaliar', 'nao foi possivel avaliar'];
@@ -518,7 +530,7 @@ ${partialAnalyses.join('\n\n')}`;
   const noClassDetected = detectNoClass(rawResponse);
   const status = noClassDetected ? 'completed_no_class_detected' : 'completed';
 
-  console.log('[pedk] dna_matrix_version=pedk_dna_v1');
+  console.log(`[pedk] dna_matrix_version=${PEDK_DNA_MATRIX_VERSION}`);
   console.log(`[pedk] expected_pillars=${PEDK_DNA_PILLARS.length}`);
   console.log('[pedk] structured_analysis_started');
 
@@ -527,7 +539,7 @@ ${partialAnalyses.join('\n\n')}`;
     rawResponse,
     userNotes: prompt
   });
-  const structuredAnalysisText = await analyzeText(structuredAnalysisPrompt).catch((error) => { throw withFailedStage(error, 'structured_analysis'); });
+  const structuredAnalysisText = await analyzeJson(structuredAnalysisPrompt).catch((error) => { throw withFailedStage(error, 'structured_analysis'); });
   let structuredAnalysis;
   try {
     structuredAnalysis = JSON.parse(extractJsonObject(structuredAnalysisText));

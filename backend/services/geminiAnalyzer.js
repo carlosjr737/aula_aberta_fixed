@@ -63,6 +63,26 @@ async function analyzeText(prompt) {
   return data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('\n') || 'Sem resposta textual';
 }
 
+async function analyzeJson(prompt) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 65536 }
+    })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data?.error?.message || 'Falha análise JSON Gemini');
+  const finishReason = data?.candidates?.[0]?.finishReason;
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+  if (finishReason && finishReason !== 'STOP') {
+    throw new Error(`Gemini interrompeu a geração do JSON (finishReason=${finishReason}); saída possivelmente truncada`);
+  }
+  return text;
+}
+
 async function countVideoTokens(fileUri, prompt, metadata) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:countTokens?key=${process.env.GEMINI_API_KEY}`;
   const response = await fetch(endpoint, {
@@ -77,4 +97,4 @@ async function countVideoTokens(fileUri, prompt, metadata) {
   return Number(data?.totalTokens || 0);
 }
 
-module.exports = { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, countVideoTokens, GEMINI_MODEL };
+module.exports = { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, analyzeJson, countVideoTokens, GEMINI_MODEL };
