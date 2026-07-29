@@ -11,6 +11,8 @@
       "start": "14:00",
       "durationMinutes": 60,
       "professor": "Ruan Lopes",
+      "teacherId": "c390435b-4155-4341-a41c-3a013176552f",
+      "classId": "d2ef0403-8997-4b64-999a-675a8faabf4d",
       "modalidade": "Danças Urbanas",
       "turma": "Juvenil",
       "faixaEtaria": "12-16",

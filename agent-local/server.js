@@ -874,6 +874,8 @@ async function finalizeRecording(recordingId) {
         horario: rec.horario,
         prompt: rec.prompt,
         cameraId: rec.cameraId,
+        teacherId: rec.teacherId,
+        classId: rec.classId,
         durationMinutes: rec.durationSeconds ? Math.max(1, Math.round(rec.durationSeconds / 60)) : null,
         recordingStartedAt: rec.startedAt,
         recordingEndedAt: rec.finishedAt
@@ -1366,6 +1368,8 @@ function startRecordingJob(options) {
     prompt: body.observacoes || body.prompt || '',
     cameraId,
     observacoes: body.observacoes || body.prompt || '',
+    teacherId: body.teacherId || body.teacher_id || null,
+    classId: body.classId || body.class_id || null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     gcsBucket: null,
