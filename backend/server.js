@@ -609,7 +609,7 @@ ${partialAnalyses.join('\n\n')}`;
     pdfPath,
     teacherId: portalTeacherId,
     classId: portalClassId,
-    lessonDate: classContext.data || null,
+    lessonDate: classContext.data || (recordingStartedAt ? String(recordingStartedAt).slice(0, 10) : null) || new Date().toISOString().slice(0, 10),
     source: 'aula_ia',
     recordingId
   }).catch((error) => { throw withFailedStage(error, 'portal_sync'); });
