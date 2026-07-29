@@ -103,7 +103,8 @@ async function syncReportToPortal({ structuredAnalysis, pdfPath, teacherId, clas
   let reportPath = null;
   if (pdfPath && fs.existsSync(pdfPath)) {
     const folder = sanitizeSegment(teacherId, 'teacher');
-    const file = `${sanitizeSegment(recordingId || 'relatorio', 'relatorio')}_${Date.now()}.pdf`;
+    const baseName = path.basename(String(recordingId || 'relatorio')).replace(/\.[^.]+$/, '');
+    const file = `${sanitizeSegment(baseName, 'relatorio')}_${Date.now()}.pdf`;
     const objectPath = path.posix.join(folder, file);
     reportPath = await uploadReportToStorage(config, pdfPath, objectPath);
   }
