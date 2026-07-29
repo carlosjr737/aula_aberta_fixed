@@ -1,4 +1,5 @@
-﻿const express = require('express');
+﻿try { require('dotenv').config(); } catch (_) { /* dotenv opcional: em produção (Railway) as envs vêm da plataforma */ }
+const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const os = require('os');
