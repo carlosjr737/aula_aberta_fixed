@@ -13,6 +13,7 @@ const { uploadToGemini, waitForGeminiActive, analyzeVideo, analyzeText, analyzeJ
 const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT, buildAnalysisPrompt, buildStructuredAnalysisPrompt } = require('./prompts/dnaProfessorDKFullOperational');
 const { validateStructuredPedkAnalysis } = require('./services/pedkValidation');
 const { generateLessonPdf } = require('./services/pdfGenerator');
+const { syncReportToPortal } = require('./services/portalSync');
 const { uploadPdf } = require('./services/googleDriveUpload');
 let ffprobeStaticPath = 'ffprobe';
 try { ffprobeStaticPath = require('ffprobe-static').path || 'ffprobe'; } catch (_error) { ffprobeStaticPath = 'ffprobe'; }
@@ -469,7 +470,7 @@ app.get('/jobs/:jobId/report', async (req, res) => {
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
-async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName, sourceUrl, sourceUrlExpiresAt, videoValidation, jobId = null }) {
+async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName, sourceUrl, sourceUrlExpiresAt, videoValidation, jobId = null, portalTeacherId = null, portalClassId = null }) {
   logStage(recordingId, 'analysis_started', { localPath: videoPath, sourceFileName });
   const classContext = buildClassContext({ ...classContextInput, cameraId }, classContextInput);
   const finalPrompt = buildAnalysisPrompt({ classContext, userNotes: prompt });
@@ -599,6 +600,22 @@ ${partialAnalyses.join('\n\n')}`;
   logStage(recordingId, 'report_upload_success', { provider: 'gcs', reportUrl: pdfUrl, reportGcsUri, reportBucket, reportFileName });
   if (jobId) console.log(`[job:${jobId}] report_upload_success reportGcsUri=${reportGcsUri}`);
   if (jobId) console.log(`[job:${jobId}] download_url_ready ${reportDownloadUrl}`);
+
+  let portalSync = { skipped: true, reason: 'not_attempted' };
+  if (jobId) updateJob(jobId, { status: 'processing', stage: 'portal_sync' });
+  logStage(recordingId, 'portal_sync_started', { teacherId: portalTeacherId || null, classId: portalClassId || null });
+  portalSync = await syncReportToPortal({
+    structuredAnalysis,
+    pdfPath,
+    teacherId: portalTeacherId,
+    classId: portalClassId,
+    lessonDate: classContext.data || null,
+    source: 'aula_ia',
+    recordingId
+  }).catch((error) => { throw withFailedStage(error, 'portal_sync'); });
+  logStage(recordingId, 'portal_sync_result', portalSync);
+  if (jobId) console.log(`[job:${jobId}] portal_sync ${JSON.stringify(portalSync)}`);
+
   if (pdfUploadProvider === 'drive') {
     const driveData = await uploadPdf(pdfPath, { professor: classContext.professor }).catch((error) => { throw withFailedStage(error, 'drive_upload'); });
     drivePdfUrl = driveData?.webViewLink || null;
@@ -628,7 +645,8 @@ ${partialAnalyses.join('\n\n')}`;
     metadata: { recordingId, analyzedAt: new Date().toISOString(), classContext },
     video: { fileName: sourceFileName || recordingId, sourceUrl: sourceUrl || null, sourceUrlExpiresAt: sourceUrlExpiresAt || null, validation: videoValidation || null },
     prompt: { dnaVersion: PEDK_DNA_MATRIX_VERSION, promptTemplateVersion: '3.0', userNotes: normalizeField(prompt), finalPromptUsed: finalPrompt, finalPromptLength: finalPrompt.length },
-    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, structuredAnalysis, status, tokenCount, strategy, segmentCount, matrixVersion: PEDK_DNA_MATRIX_VERSION }
+    analysis: { provider: 'gemini', model: GEMINI_MODEL, rawResponse, structuredAnalysis, status, tokenCount, strategy, segmentCount, matrixVersion: PEDK_DNA_MATRIX_VERSION },
+    portalSync
   };
   if (drivePdfUrl) responsePayload.drivePdfUrl = drivePdfUrl;
   if (reportDownloadUrl) responsePayload.downloadUrl = reportDownloadUrl;
@@ -746,7 +764,9 @@ async function runAnalyzeGcs(payload, jobId = null) {
       sourceFileName: gcsFileName,
       sourceUrl: body.videoUrl || `gs://${gcsBucket}/${gcsFileName}`,
       videoValidation,
-      jobId
+      jobId,
+      portalTeacherId: body.teacherId || body.teacher_id || null,
+      portalClassId: body.classId || body.class_id || null
     });
 
     console.log('[analyze-gcs] analysis_success');
@@ -787,7 +807,8 @@ async function processAnalyzeGcsJob(jobId, payload) {
         signedReportUrl: result.signedReportUrl || null,
         drivePdfUrl: result.drivePdfUrl || null,
         videoFile: result.videoFile || null,
-        metadata: result.metadata || null
+        metadata: result.metadata || null,
+        portalSync: result.portalSync || null
       },
       error: null
     });
