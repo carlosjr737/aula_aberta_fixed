@@ -51,14 +51,9 @@ function validateStructuredPedkAnalysis(structuredAnalysis, pillars) {
       throw new Error(`Nota inválida para ${item.code}: ${item.score}`);
     }
 
-    const expectedWeighted = Number((score * expected.weight).toFixed(2));
-    const receivedWeighted = Number(item.weightedScore);
-
-    if (!Number.isFinite(receivedWeighted) || Math.abs(receivedWeighted - expectedWeighted) > 0.05) {
-      throw new Error(`weightedScore inválido para ${item.code}: esperado ${expectedWeighted}, recebido ${item.weightedScore}`);
-    }
-
-    item.weightedScore = expectedWeighted;
+    // weightedScore é derivado (score * peso). Não confiamos na aritmética do
+    // modelo: recalculamos e sobrescrevemos em vez de rejeitar.
+    item.weightedScore = Number((score * expected.weight).toFixed(2));
   }
 
   for (const expected of pillars) {
@@ -75,11 +70,10 @@ function validateStructuredPedkAnalysis(structuredAnalysis, pillars) {
 
   const weightedSum = structuredAnalysis.pillarScores.reduce((sum, item) => sum + Number(item.weightedScore || 0), 0);
   const expectedFinalScore = Number((weightedSum / totalWeight).toFixed(2));
-  const receivedFinalScore = Number(structuredAnalysis.finalScore);
 
-  if (!Number.isFinite(receivedFinalScore) || Math.abs(receivedFinalScore - expectedFinalScore) > 0.05) {
-    throw new Error(`finalScore inválido: esperado ${expectedFinalScore}, recebido ${structuredAnalysis.finalScore}`);
-  }
+  // finalScore é derivado (soma ponderada / soma dos pesos). Recalculamos e
+  // sobrescrevemos — o modelo costuma errar essa conta.
+  structuredAnalysis.finalScore = expectedFinalScore;
 
   if (!structuredAnalysis.classification) {
     throw new Error('classification é obrigatório');
