@@ -18,7 +18,8 @@ const DEBUG_ENV_KEYS = [
   'GCS_BUCKET_NAME',
   'RTSP_SUBWAY',
   'RTSP_BOLSO',
-  'RTSP_MIRANTE'
+  'RTSP_MIRANTE',
+  'RTSP_AQUARIO'
 ];
 
 function toBool(value) { return Boolean(String(value || '').trim()); }
@@ -569,7 +570,7 @@ fs.mkdirSync(PROCESSED_JOBS_DIR, { recursive: true });
 fs.mkdirSync(REPORTS_DIR, { recursive: true });
 fs.mkdirSync(REPORT_ERRORS_DIR, { recursive: true });
 
-const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY };
+const CAMERAS = { bolso: process.env.RTSP_BOLSO, mirante: process.env.RTSP_MIRANTE, subway: process.env.RTSP_SUBWAY, aquario: process.env.RTSP_AQUARIO };
 const recordings = new Map();
 const recordingQueues = new Map();
 const activeRecordings = new Map();
