@@ -3,3 +3,4 @@ recordings/
 *.mp4
 .DS_Store
 node_modules/
+scheduled-jobs.json

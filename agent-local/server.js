@@ -1366,9 +1366,9 @@ function startRecordingJob(options) {
     nivel: body.nivel || '',
     sala: body.sala || '',
     horario: body.horario || body.start || '',
-    prompt: body.observacoes || body.prompt || '',
+    prompt: body.observacoes || body.prompt || process.env.DEFAULT_OBSERVACOES || '',
     cameraId,
-    observacoes: body.observacoes || body.prompt || '',
+    observacoes: body.observacoes || body.prompt || process.env.DEFAULT_OBSERVACOES || '',
     teacherId: body.teacherId || body.teacher_id || null,
     classId: body.classId || body.class_id || null,
     startedAt: new Date().toISOString(),
@@ -1930,5 +1930,98 @@ app.get('/debug/open-report/:jobId', async (req, res) => {
     });
   }
 });
+
+// ===== Agendador de gravações pontuais (SouAle) =====
+const SCHEDULED_JOBS_PATH = path.join(__dirname, 'scheduled-jobs.json');
+const scheduledJobs = new Map();
+
+function loadScheduledJobs() {
+  try {
+    if (fs.existsSync(SCHEDULED_JOBS_PATH)) {
+      const arr = JSON.parse(fs.readFileSync(SCHEDULED_JOBS_PATH, 'utf-8'));
+      if (Array.isArray(arr)) arr.forEach((j) => j && j.id && scheduledJobs.set(j.id, j));
+      console.log(`[schedule] ${scheduledJobs.size} agendamento(s) carregado(s) do disco`);
+    }
+  } catch (error) { console.error('[schedule] falha ao carregar:', error.message); }
+}
+
+function saveScheduledJobs() {
+  try { fs.writeFileSync(SCHEDULED_JOBS_PATH, JSON.stringify([...scheduledJobs.values()], null, 2)); }
+  catch (error) { console.error('[schedule] falha ao salvar:', error.message); }
+}
+
+function parseScheduledAt(date, time) {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || '').trim());
+  const t = /^(\d{1,2}):(\d{2})$/.exec(String(time || '').trim());
+  if (!d || !t) return null;
+  const when = new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3]), Number(t[1]), Number(t[2]), 0, 0);
+  return Number.isNaN(when.getTime()) ? null : when;
+}
+
+app.post('/schedule', (req, res) => {
+  const b = req.body || {};
+  const when = parseScheduledAt(b.date, b.time);
+  if (!when) return res.status(400).json({ error: 'date (YYYY-MM-DD) e time (HH:mm) válidos são obrigatórios.' });
+  if (!b.cameraId) return res.status(400).json({ error: 'cameraId é obrigatório.' });
+  if (!CAMERAS[String(b.cameraId).toLowerCase()]) return res.status(400).json({ error: `câmera desconhecida: ${b.cameraId}`, cameras: Object.keys(CAMERAS) });
+  if (when.getTime() < Date.now() - 60 * 1000) return res.status(400).json({ error: 'horário no passado.' });
+  const id = crypto.randomUUID();
+  const job = {
+    id, status: 'agendada', scheduledAt: when.toISOString(), date: b.date, time: b.time,
+    cameraId: b.cameraId, sala: b.sala || '', professor: b.professor || '', teacherId: b.teacherId || '',
+    classId: b.classId || '', turma: b.turma || '', modalidade: b.modalidade || '', nivel: b.nivel || '',
+    durationMinutes: Number(b.durationMinutes) || 60, observacoes: b.observacoes || '',
+    recordingId: null, error: null, createdAt: new Date().toISOString()
+  };
+  scheduledJobs.set(id, job);
+  saveScheduledJobs();
+  console.log(`[schedule] agendada ${id} ${b.date} ${b.time} camera=${b.cameraId} prof=${b.professor}`);
+  return res.json({ ok: true, job });
+});
+
+app.get('/schedule', (_req, res) => res.json({ jobs: [...scheduledJobs.values()].sort((a, b) => String(a.scheduledAt).localeCompare(String(b.scheduledAt))) }));
+
+app.delete('/schedule/:id', (req, res) => {
+  const job = scheduledJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'agendamento não encontrado' });
+  if (job.status !== 'agendada') return res.status(400).json({ error: `não é possível cancelar (status=${job.status})` });
+  job.status = 'cancelada';
+  saveScheduledJobs();
+  return res.json({ ok: true, job });
+});
+
+function runScheduleTick() {
+  const now = Date.now();
+  for (const job of scheduledJobs.values()) {
+    if (job.status !== 'agendada') continue;
+    const when = new Date(job.scheduledAt).getTime();
+    if (Number.isNaN(when) || now < when) continue;
+    if (now - when > 15 * 60 * 1000) {
+      job.status = 'perdida';
+      console.log(`[schedule] ${job.id} perdida (atraso > 15min)`);
+      saveScheduledJobs();
+      continue;
+    }
+    try {
+      const rec = startRecordingJob({ body: {
+        cameraId: job.cameraId, camera: job.cameraId, sala: job.sala,
+        professor: job.professor, teacherId: job.teacherId, classId: job.classId,
+        turma: job.turma, modalidade: job.modalidade, nivel: job.nivel,
+        horario: job.time, durationMinutes: job.durationMinutes, observacoes: job.observacoes
+      }, source: 'schedule-oneoff' });
+      job.status = 'disparada';
+      job.recordingId = rec.recordingId;
+      console.log(`[schedule] ${job.id} disparada -> recording ${rec.recordingId}`);
+    } catch (error) {
+      job.status = 'falha_disparo';
+      job.error = error.message;
+      console.error(`[schedule] ${job.id} falha ao disparar:`, error.message);
+    }
+    saveScheduledJobs();
+  }
+}
+
+loadScheduledJobs();
+setInterval(runScheduleTick, 30 * 1000);
 
 app.listen(PORT, () => console.log(`Agent local rodando na porta ${PORT}`));
