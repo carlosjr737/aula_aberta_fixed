@@ -14,6 +14,7 @@ const { PEDK_DNA_MATRIX_VERSION, PEDK_DNA_PILLARS, PEDK_DNA_PROMPT, buildAnalysi
 const { validateStructuredPedkAnalysis } = require('./services/pedkValidation');
 const { generateLessonPdf } = require('./services/pdfGenerator');
 const { syncReportToPortal } = require('./services/portalSync');
+const { generateSignedReadUrl } = require('./services/gcsStorage');
 const { uploadPdf } = require('./services/googleDriveUpload');
 let ffprobeStaticPath = 'ffprobe';
 try { ffprobeStaticPath = require('ffprobe-static').path || 'ffprobe'; } catch (_error) { ffprobeStaticPath = 'ffprobe'; }
@@ -468,6 +469,22 @@ app.get('/jobs/:jobId/report', async (req, res) => {
   }
 });
 app.get('/default-prompt', (_req, res) => res.json({ defaultPrompt: DEFAULT_PROMPT }));
+
+// Link seguro (temporário) para baixar o vídeo da aula. Só assina objetos de
+// gravação (recordings/.../*.mp4); o Portal chama isto ao clicar em "baixar vídeo".
+app.get('/video-signed-url', async (req, res) => {
+  const file = String(req.query.file || '').trim();
+  if (!/^recordings\/[0-9a-fA-F-]{8,}\/[\w.\- ]+\.mp4$/.test(file)) {
+    return res.status(400).json({ ok: false, error: 'file inválido' });
+  }
+  try {
+    const url = await generateSignedReadUrl(file, 60);
+    return res.json({ ok: true, url, expiresInMinutes: 60 });
+  } catch (error) {
+    console.error('[video-signed-url] falha:', error.message);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
 app.get('/debug-env', (_req, res) => res.json({ GEMINI_API_KEY: Boolean(process.env.GEMINI_API_KEY), GEMINI_MODEL: Boolean(process.env.GEMINI_MODEL), GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON), PDF_UPLOAD_PROVIDER: Boolean(process.env.PDF_UPLOAD_PROVIDER) }));
 
 async function analyzeFromLocalVideo({ videoPath, recordingId, classContextInput, prompt, cameraId, recordingStartedAt, recordingEndedAt, sourceFileName, sourceUrl, sourceUrlExpiresAt, videoValidation, jobId = null, portalTeacherId = null, portalClassId = null }) {
@@ -611,7 +628,8 @@ ${partialAnalyses.join('\n\n')}`;
     classId: portalClassId,
     lessonDate: classContext.data || (recordingStartedAt ? String(recordingStartedAt).slice(0, 10) : null) || new Date().toISOString().slice(0, 10),
     source: 'aula_ia',
-    recordingId
+    recordingId,
+    videoGcsFile: sourceFileName || null
   }).catch((error) => { throw withFailedStage(error, 'portal_sync'); });
   logStage(recordingId, 'portal_sync_result', portalSync);
   if (jobId) console.log(`[job:${jobId}] portal_sync ${JSON.stringify(portalSync)}`);

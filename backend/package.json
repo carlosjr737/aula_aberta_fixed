@@ -11,6 +11,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.22.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",

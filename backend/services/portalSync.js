@@ -31,7 +31,7 @@ function toTextArray(items, pick) {
 }
 
 // Deriva os campos da tabela a partir do JSON estruturado do PEDK.
-function buildAssessmentRow({ structuredAnalysis, teacherId, classId, lessonDate, source, reportPath }) {
+function buildAssessmentRow({ structuredAnalysis, teacherId, classId, lessonDate, source, reportPath, videoGcsFile }) {
   const sa = structuredAnalysis || {};
   const strengths = toTextArray(sa.strengths, (s) => s.title || s.description);
   const improvements = [
@@ -54,6 +54,7 @@ function buildAssessmentRow({ structuredAnalysis, teacherId, classId, lessonDate
   };
   if (classId) row.class_id = classId;
   if (lessonDate) row.lesson_date = lessonDate;
+  if (videoGcsFile) row.video_gcs_file = videoGcsFile;
   return row;
 }
 
@@ -95,7 +96,7 @@ function sanitizeSegment(value, fallback) {
 
 // Orquestra o envio completo ao Portal. Retorna { skipped } quando não há
 // configuração ou teacherId; caso contrário { ok, assessmentId, reportPath }.
-async function syncReportToPortal({ structuredAnalysis, pdfPath, teacherId, classId, lessonDate, source, recordingId }) {
+async function syncReportToPortal({ structuredAnalysis, pdfPath, teacherId, classId, lessonDate, source, recordingId, videoGcsFile }) {
   const config = getPortalConfig();
   if (!config.enabled) return { skipped: true, reason: 'supabase_not_configured' };
   if (!teacherId) return { skipped: true, reason: 'missing_teacher_id' };
@@ -109,7 +110,7 @@ async function syncReportToPortal({ structuredAnalysis, pdfPath, teacherId, clas
     reportPath = await uploadReportToStorage(config, pdfPath, objectPath);
   }
 
-  const row = buildAssessmentRow({ structuredAnalysis, teacherId, classId, lessonDate, source, reportPath });
+  const row = buildAssessmentRow({ structuredAnalysis, teacherId, classId, lessonDate, source, reportPath, videoGcsFile });
   const inserted = await insertAssessment(config, row);
   return { ok: true, assessmentId: inserted?.id || null, reportPath, source: row.source };
 }
